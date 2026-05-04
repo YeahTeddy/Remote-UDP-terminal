@@ -3,6 +3,8 @@ import threading
 import time
 import random
 import sys
+import os
+import getpass
 from common import *
 
 
@@ -16,22 +18,18 @@ class UDPClient:
         self.send_seq = 0
         self.recv_expected_seq = 0
         self.ack_event = threading.Event()
+        self.output_done_event = threading.Event()
         self.waiting_seq = -1
         self.print_lock = threading.Lock()
+        self.prompt_user = getpass.getuser()
+        self.prompt_host = server_host
         print(f"Client ID: {self.client_id}, connecting to {server_host}:{server_port}")
 
-    def _input_thread(self):
-        while self.running:
-            try:
-                cmd = sys.stdin.readline()
-                if not cmd:
-                    continue
-                if cmd.strip() == 'exit':
-                    self.stop()
-                    break
-                self._send_reliable(cmd.encode('utf-8'))
-            except Exception:
-                break
+    def _prompt(self):
+        cwd = os.getcwd().rstrip('\\/')
+        current_dir = os.path.basename(cwd) or cwd
+        suffix = '#' if self.prompt_user in ('root', 'Administrator') else '$'
+        return f"[{self.prompt_user}@{self.prompt_host} {current_dir}]{suffix} "
 
     def start(self):
         self.running = True
@@ -39,16 +37,32 @@ class UDPClient:
         heartbeat_thread.start()
         recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         recv_thread.start()
-        input_thread = threading.Thread(target=self._input_thread, daemon=True)
-        input_thread.start()
         print("Connected to server, enter commands to execute, 'exit' to quit")
-        try:
-            while self.running:
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            self._send_interrupt()
-            time.sleep(0.5)
-            self.stop()
+
+        while self.running:
+            try:
+                cmd = input(self._prompt())
+            except KeyboardInterrupt:
+                print("^C")
+                continue
+            except EOFError:
+                self.stop()
+                break
+
+            if cmd.strip() == 'exit':
+                self.stop()
+                break
+            if not cmd.strip():
+                continue
+
+            self.output_done_event.clear()
+            if self._send_reliable((cmd + '\n').encode('utf-8')):
+                while self.running and not self.output_done_event.is_set():
+                    try:
+                        self.output_done_event.wait(0.1)
+                    except KeyboardInterrupt:
+                        print("^C")
+                        self._send_interrupt()
 
     def stop(self):
         self.running = False
@@ -85,9 +99,12 @@ class UDPClient:
                         self.ack_event.set()
                 elif msg_type == TYPE_OUTPUT:
                     if seq == self.recv_expected_seq:
-                        with self.print_lock:
-                            sys.stdout.write(payload.decode('utf-8', errors='replace'))
-                            sys.stdout.flush()
+                        if payload:
+                            with self.print_lock:
+                                sys.stdout.write(payload.decode('utf-8', errors='replace'))
+                                sys.stdout.flush()
+                        else:
+                            self.output_done_event.set()
                         self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
                     ack_msg = pack_msg(TYPE_ACK, seq, self.client_id, b'')
                     self.sock.sendto(ack_msg, self.server_addr)

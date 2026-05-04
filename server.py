@@ -77,6 +77,7 @@ class UDPServer:
                     print(f"Recv error: {e}")
 
     def _handle_heartbeat(self, client_id, seq, addr):
+        print(f"Heartbeat received from client {client_id} at {addr}")
         ack_msg = pack_msg(TYPE_ACK, seq, client_id, b'')
         self.sock.sendto(ack_msg, addr)
 
@@ -104,8 +105,10 @@ class UDPServer:
         addr = client.addr
         max_retries = 5
 
-        for i in range(0, len(data), MAX_DATA_SIZE):
-            chunk = data[i:i + MAX_DATA_SIZE]
+        chunks = [data[i:i + MAX_DATA_SIZE] for i in range(0, len(data), MAX_DATA_SIZE)]
+        chunks.append(b'')
+
+        for chunk in chunks:
             seq = client.send_seq
             ack_event = threading.Event()
             with self.ack_lock:

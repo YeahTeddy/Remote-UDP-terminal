@@ -34,9 +34,11 @@ def recv_response(sock, cid, addr, timeout=5):
             if resp[0] == TYPE_ACK:
                 got_ack = True
             elif resp[0] == TYPE_OUTPUT:
-                all_data += resp[3]
                 ack = pack_msg(TYPE_ACK, resp[1], cid, b'')
                 sock.sendto(ack, addr)
+                if not resp[3]:
+                    break
+                all_data += resp[3]
                 sock.settimeout(1)
     except socket.timeout:
         pass
