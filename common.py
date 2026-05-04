@@ -1,28 +1,57 @@
 import struct
 
-MAGIC = 0x1234
-TYPE_DATA = 0
-TYPE_ACK = 1
-TYPE_HEARTBEAT = 2
-TYPE_INTERRUPT = 3
+MAGIC = 0x5554
+TYPE_COMMAND = 0x01
+TYPE_OUTPUT = 0x02
+TYPE_ACK = 0x03
+TYPE_HEARTBEAT = 0x04
+TYPE_INTERRUPT = 0x05
 
-HEADER_FORMAT = '>H B B I I'
+VALID_TYPES = {TYPE_COMMAND, TYPE_OUTPUT, TYPE_ACK, TYPE_HEARTBEAT, TYPE_INTERRUPT}
+HEADER_FORMAT = '>H B I H I'
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 MAX_DATA_SIZE = 1472 - HEADER_SIZE
+MAX_SEQUENCE = 0xFFFFFFFF
+DATA_SEQUENCE_MOD = MAX_SEQUENCE
+HEARTBEAT_SEQ = MAX_SEQUENCE
+
+
+def next_data_seq(seq: int) -> int:
+    return (seq + 1) % DATA_SEQUENCE_MOD
+
+
+def normalize_command_input(text: str) -> str:
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    result = []
+    for ch in text:
+        if ch in ('\b', '\x7f'):
+            if result:
+                result.pop()
+        else:
+            result.append(ch)
+    return ''.join(result)
+
 
 def pack_msg(msg_type: int, seq: int, client_id: int, data: bytes) -> bytes:
+    if msg_type not in VALID_TYPES:
+        raise ValueError("Invalid message type")
+    if not 0 <= seq <= MAX_SEQUENCE:
+        raise ValueError("Sequence number out of range")
+    if not 0 <= client_id <= 0xFFFFFFFF:
+        raise ValueError("Client ID out of range")
     if len(data) > MAX_DATA_SIZE:
         raise ValueError(f"Data size exceeds maximum of {MAX_DATA_SIZE} bytes")
-    header = struct.pack(HEADER_FORMAT, MAGIC, msg_type, seq, client_id, len(data))
+    header = struct.pack(HEADER_FORMAT, MAGIC, msg_type, seq, len(data), client_id)
     return header + data
+
 
 def unpack_msg(raw_data: bytes) -> tuple[int, int, int, bytes] | None:
     if len(raw_data) < HEADER_SIZE:
         return None
-    magic, msg_type, seq, client_id, data_len = struct.unpack(HEADER_FORMAT, raw_data[:HEADER_SIZE])
-    if magic != MAGIC:
+    magic, msg_type, seq, data_len, client_id = struct.unpack(HEADER_FORMAT, raw_data[:HEADER_SIZE])
+    if magic != MAGIC or msg_type not in VALID_TYPES:
         return None
-    if len(raw_data) < HEADER_SIZE + data_len:
+    if len(raw_data) != HEADER_SIZE + data_len:
         return None
-    data = raw_data[HEADER_SIZE:HEADER_SIZE + data_len]
+    data = raw_data[HEADER_SIZE:]
     return (msg_type, seq, client_id, data)

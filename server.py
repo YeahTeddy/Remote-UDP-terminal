@@ -3,9 +3,9 @@ import threading
 import time
 import subprocess
 import os
+import locale
 from common import *
 
-HEARTBEAT_SEQ = 255
 
 class ClientInfo:
     def __init__(self, addr):
@@ -16,6 +16,7 @@ class ClientInfo:
         self.current_process = None
         self.process_lock = threading.Lock()
 
+
 class UDPServer:
     def __init__(self, host='0.0.0.0', port=9999):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -25,6 +26,7 @@ class UDPServer:
         self.ack_events = {}
         self.ack_lock = threading.Lock()
         self.running = False
+        self.encoding = locale.getpreferredencoding(False) or 'utf-8'
         print(f"UDP Server started on {host}:{port}")
 
     def start(self):
@@ -66,8 +68,8 @@ class UDPServer:
                     self._handle_heartbeat(client_id, seq, addr)
                 elif msg_type == TYPE_ACK:
                     self._handle_ack(client_id, seq)
-                elif msg_type == TYPE_DATA:
-                    self._handle_data(client_id, seq, payload, addr)
+                elif msg_type == TYPE_COMMAND:
+                    self._handle_command(client_id, seq, payload, addr)
                 elif msg_type == TYPE_INTERRUPT:
                     self._handle_interrupt(client_id)
             except Exception as e:
@@ -91,7 +93,7 @@ class UDPServer:
                 if client.current_process:
                     try:
                         client.current_process.terminate()
-                    except:
+                    except Exception:
                         pass
                     client.current_process = None
 
@@ -113,14 +115,13 @@ class UDPServer:
             success = False
             while retry_count < max_retries and self.running:
                 try:
-                    msg = pack_msg(TYPE_DATA, seq, client_id, chunk)
+                    msg = pack_msg(TYPE_OUTPUT, seq, client_id, chunk)
                     self.sock.sendto(msg, addr)
                     if ack_event.wait(timeout=2):
                         success = True
                         break
-                    else:
-                        retry_count += 1
-                        print(f"Retry {retry_count}/{max_retries} for client {client_id} seq {seq}")
+                    retry_count += 1
+                    print(f"Retry {retry_count}/{max_retries} for client {client_id} seq {seq}")
                 except Exception as e:
                     print(f"Send error: {e}")
                     retry_count += 1
@@ -132,11 +133,11 @@ class UDPServer:
                 print(f"Failed to send to client {client_id} after {max_retries} retries")
                 return False
 
-            client.send_seq = (client.send_seq + 1) % 256
+            client.send_seq = next_data_seq(client.send_seq)
 
         return True
 
-    def _handle_data(self, client_id, seq, payload, addr):
+    def _handle_command(self, client_id, seq, payload, addr):
         client = self.clients[client_id]
 
         if seq != client.recv_expected_seq:
@@ -144,11 +145,12 @@ class UDPServer:
             self.sock.sendto(ack_msg, addr)
             return
 
-        client.recv_expected_seq = (client.recv_expected_seq + 1) % 256
+        client.recv_expected_seq = next_data_seq(client.recv_expected_seq)
         ack_msg = pack_msg(TYPE_ACK, seq, client_id, b'')
         self.sock.sendto(ack_msg, addr)
 
-        cmd = payload.decode('utf-8', errors='replace').strip()
+        text = payload.decode('utf-8', errors='replace')
+        cmd = normalize_command_input(text).rstrip('\r\n')
         if not cmd:
             return
 
@@ -157,6 +159,11 @@ class UDPServer:
             args=(client_id, cmd),
             daemon=True
         ).start()
+
+    def _decode_output(self, data):
+        if not data:
+            return ''
+        return data.decode(self.encoding, errors='replace')
 
     def _execute_and_respond(self, client_id, cmd):
         client = self.clients.get(client_id)
@@ -184,13 +191,11 @@ class UDPServer:
 
             try:
                 stdout, stderr = proc.communicate(timeout=30)
-                output = stdout.decode('utf-8', errors='replace') + stderr.decode('utf-8', errors='replace')
+                output = self._decode_output(stdout) + self._decode_output(stderr)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 stdout, stderr = proc.communicate()
-                output = (stdout.decode('utf-8', errors='replace') if stdout else '') + \
-                         (stderr.decode('utf-8', errors='replace') if stderr else '') + \
-                         "Error: Command execution timed out\n"
+                output = self._decode_output(stdout) + self._decode_output(stderr) + "Error: Command execution timed out\n"
             finally:
                 with client.process_lock:
                     if client.current_process == proc:
@@ -205,24 +210,21 @@ class UDPServer:
         while self.running:
             now = time.time()
             to_remove = []
-            for cid, client in self.clients.items():
+            for cid, client in list(self.clients.items()):
                 if now - client.last_heartbeat > 30:
                     with client.process_lock:
                         if client.current_process:
                             try:
                                 client.current_process.terminate()
-                            except:
+                            except Exception:
                                 pass
                     to_remove.append(cid)
             for cid in to_remove:
                 print(f"Client {cid} timed out, removed")
                 del self.clients[cid]
 
-            with self.ack_lock:
-                expired = [k for k, v in self.ack_events.items() if not v.is_set()]
-                # events will be cleaned up when _send_reliable finishes
-
             time.sleep(5)
+
 
 if __name__ == '__main__':
     import argparse

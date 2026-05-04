@@ -3,10 +3,8 @@ import threading
 import time
 import random
 import sys
-import os
 from common import *
 
-HEARTBEAT_SEQ = 255
 
 class UDPClient:
     def __init__(self, server_host='127.0.0.1', server_port=9999):
@@ -32,7 +30,7 @@ class UDPClient:
                     self.stop()
                     break
                 self._send_reliable(cmd.encode('utf-8'))
-            except:
+            except Exception:
                 break
 
     def start(self):
@@ -61,7 +59,7 @@ class UDPClient:
         try:
             msg = pack_msg(TYPE_INTERRUPT, self.send_seq, self.client_id, b'')
             self.sock.sendto(msg, self.server_addr)
-        except:
+        except Exception:
             pass
 
     def _heartbeat_loop(self):
@@ -69,7 +67,7 @@ class UDPClient:
             try:
                 msg = pack_msg(TYPE_HEARTBEAT, HEARTBEAT_SEQ, self.client_id, b'')
                 self.sock.sendto(msg, self.server_addr)
-            except:
+            except Exception:
                 pass
             time.sleep(5)
 
@@ -85,12 +83,12 @@ class UDPClient:
                 if msg_type == TYPE_ACK:
                     if seq == self.waiting_seq:
                         self.ack_event.set()
-                elif msg_type == TYPE_DATA:
+                elif msg_type == TYPE_OUTPUT:
                     if seq == self.recv_expected_seq:
                         with self.print_lock:
                             sys.stdout.write(payload.decode('utf-8', errors='replace'))
                             sys.stdout.flush()
-                        self.recv_expected_seq = (self.recv_expected_seq + 1) % 256
+                        self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
                     ack_msg = pack_msg(TYPE_ACK, seq, self.client_id, b'')
                     self.sock.sendto(ack_msg, self.server_addr)
             except socket.timeout:
@@ -107,16 +105,15 @@ class UDPClient:
 
         while retry_count < max_retries and self.running:
             try:
-                msg = pack_msg(TYPE_DATA, self.send_seq, self.client_id, data)
+                msg = pack_msg(TYPE_COMMAND, self.send_seq, self.client_id, data)
                 self.sock.sendto(msg, self.server_addr)
                 if self.ack_event.wait(timeout=2):
-                    self.send_seq = (self.send_seq + 1) % 256
+                    self.send_seq = next_data_seq(self.send_seq)
                     self.waiting_seq = -1
                     return True
-                else:
-                    retry_count += 1
-                    with self.print_lock:
-                        print(f"\nTimeout, retrying {retry_count}/{max_retries}")
+                retry_count += 1
+                with self.print_lock:
+                    print(f"\nTimeout waiting for ACK, retrying {retry_count}/{max_retries}")
             except Exception as e:
                 with self.print_lock:
                     print(f"\nSend error: {e}")
@@ -124,8 +121,9 @@ class UDPClient:
 
         self.waiting_seq = -1
         with self.print_lock:
-            print("\nSend failed after max retries, server may be unreachable")
+            print("\nSend failed after retries: server may be unreachable or network interrupted")
         return False
+
 
 if __name__ == '__main__':
     import argparse
