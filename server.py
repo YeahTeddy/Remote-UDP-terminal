@@ -77,7 +77,8 @@ class UDPServer:
                     print(f"Recv error: {e}")
 
     def _handle_heartbeat(self, client_id, seq, addr):
-        print(f"Heartbeat received from client {client_id} at {addr}")
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{timestamp}] Heartbeat received from client {client_id} at {addr}")
         ack_msg = pack_msg(TYPE_ACK, seq, client_id, b'')
         self.sock.sendto(ack_msg, addr)
 
