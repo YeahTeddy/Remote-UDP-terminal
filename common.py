@@ -15,6 +15,7 @@ MAX_SEQUENCE = 0xFFFFFFFF
 DATA_SEQUENCE_MOD = MAX_SEQUENCE
 HEARTBEAT_SEQ = MAX_SEQUENCE
 OUTPUT_DONE_PREFIX = b'\x00CWD:'
+PROMPT_INFO_PREFIX = b'\x00PROMPT:'
 
 
 def next_data_seq(seq: int) -> int:
@@ -43,6 +44,19 @@ def unpack_output_done(data: bytes) -> str | None:
     if data.startswith(OUTPUT_DONE_PREFIX):
         return data[len(OUTPUT_DONE_PREFIX):].decode('utf-8', errors='replace')
     return None
+
+
+def pack_prompt_info(user: str, host: str, cwd: str) -> bytes:
+    return PROMPT_INFO_PREFIX + '\0'.join((user, host, cwd)).encode('utf-8')
+
+
+def unpack_prompt_info(data: bytes) -> tuple[str, str, str] | None:
+    if not data.startswith(PROMPT_INFO_PREFIX):
+        return None
+    parts = data[len(PROMPT_INFO_PREFIX):].decode('utf-8', errors='replace').split('\0', 2)
+    if len(parts) != 3:
+        return None
+    return (parts[0], parts[1], parts[2])
 
 
 def pack_msg(msg_type: int, seq: int, client_id: int, data: bytes) -> bytes:

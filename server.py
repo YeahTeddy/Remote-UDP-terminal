@@ -3,8 +3,11 @@ import threading
 import time
 import subprocess
 import os
+import signal
 import locale
 import shlex
+import getpass
+import platform
 from common import *
 
 
@@ -29,6 +32,8 @@ class UDPServer:
         self.ack_lock = threading.Lock()
         self.running = False
         self.encoding = locale.getpreferredencoding(False) or 'utf-8'
+        self.server_user = getpass.getuser()
+        self.server_host = platform.node() or socket.gethostname()
         print(f"UDP Server started on {host}:{port}")
 
     def start(self):
@@ -81,7 +86,9 @@ class UDPServer:
     def _handle_heartbeat(self, client_id, seq, addr):
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         print(f"[{timestamp}] Heartbeat received from client {client_id} at {addr}")
-        ack_msg = pack_msg(TYPE_ACK, seq, client_id, b'')
+        client = self.clients[client_id]
+        payload = pack_prompt_info(self.server_user, self.server_host, client.cwd)
+        ack_msg = pack_msg(TYPE_ACK, seq, client_id, payload)
         self.sock.sendto(ack_msg, addr)
 
     def _handle_ack(self, client_id, seq):
@@ -90,16 +97,45 @@ class UDPServer:
             if key in self.ack_events:
                 self.ack_events[key].set()
 
+    def _kill_process_tree(self, proc):
+        try:
+            if os.name == 'nt':
+                subprocess.run(
+                    ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False
+                )
+            else:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _interrupt_process(self, proc):
+        try:
+            if os.name == 'nt':
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+                time.sleep(0.2)
+                if proc.poll() is None:
+                    self._kill_process_tree(proc)
+            else:
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+        except Exception:
+            self._kill_process_tree(proc)
+
     def _handle_interrupt(self, client_id):
         client = self.clients.get(client_id)
-        if client:
-            with client.process_lock:
-                if client.current_process:
-                    try:
-                        client.current_process.terminate()
-                    except Exception:
-                        pass
-                    client.current_process = None
+        if not client:
+            return
+
+        with client.process_lock:
+            proc = client.current_process
+
+        if proc and proc.poll() is None:
+            self._interrupt_process(proc)
 
     def _send_reliable(self, client_id, data):
         client = self.clients.get(client_id)
@@ -250,7 +286,7 @@ class UDPServer:
                 stdout, stderr = proc.communicate(timeout=30)
                 output = self._decode_output(stdout) + self._decode_output(stderr)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                self._kill_process_tree(proc)
                 stdout, stderr = proc.communicate()
                 output = self._decode_output(stdout) + self._decode_output(stderr) + "Error: Command execution timed out\n"
             finally:
@@ -270,11 +306,9 @@ class UDPServer:
             for cid, client in list(self.clients.items()):
                 if now - client.last_heartbeat > 30:
                     with client.process_lock:
-                        if client.current_process:
-                            try:
-                                client.current_process.terminate()
-                            except Exception:
-                                pass
+                        proc = client.current_process
+                    if proc and proc.poll() is None:
+                        self._kill_process_tree(proc)
                     to_remove.append(cid)
             for cid in to_remove:
                 print(f"Client {cid} timed out, removed")

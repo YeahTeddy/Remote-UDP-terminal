@@ -107,7 +107,9 @@ sock_hb.sendto(pack_msg(TYPE_HEARTBEAT, HEARTBEAT_SEQ, cid_hb, b''), addr)
 try:
     resp_data, _ = sock_hb.recvfrom(1500)
     resp = unpack_msg(resp_data)
+    prompt_info = unpack_prompt_info(resp[3]) if resp else None
     log_test("Heartbeat ACK received", resp is not None and resp[0] == TYPE_ACK and resp[1] == HEARTBEAT_SEQ)
+    log_test("Heartbeat carries prompt info", prompt_info is not None and len(prompt_info[0]) > 0 and len(prompt_info[1]) > 0 and prompt_info[2] == os.getcwd())
 except socket.timeout:
     log_test("Heartbeat ACK received", False, "timeout")
 sock_hb.close()
