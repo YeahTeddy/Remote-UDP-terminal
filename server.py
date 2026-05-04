@@ -4,6 +4,7 @@ import time
 import subprocess
 import os
 import locale
+import shlex
 from common import *
 
 
@@ -13,6 +14,7 @@ class ClientInfo:
         self.last_heartbeat = time.time()
         self.recv_expected_seq = 0
         self.send_seq = 0
+        self.cwd = os.getcwd()
         self.current_process = None
         self.process_lock = threading.Lock()
 
@@ -107,7 +109,7 @@ class UDPServer:
         max_retries = 5
 
         chunks = [data[i:i + MAX_DATA_SIZE] for i in range(0, len(data), MAX_DATA_SIZE)]
-        chunks.append(b'')
+        chunks.append(pack_output_done(client.cwd))
 
         for chunk in chunks:
             seq = client.send_seq
@@ -158,11 +160,60 @@ class UDPServer:
         if not cmd:
             return
 
+        if self._is_cd_command(cmd):
+            threading.Thread(
+                target=self._change_directory_and_respond,
+                args=(client_id, cmd),
+                daemon=True
+            ).start()
+            return
+
         threading.Thread(
             target=self._execute_and_respond,
             args=(client_id, cmd),
             daemon=True
         ).start()
+
+    def _split_command(self, cmd):
+        try:
+            return shlex.split(cmd, posix=os.name != 'nt')
+        except ValueError:
+            return cmd.split()
+
+    def _is_cd_command(self, cmd):
+        tokens = self._split_command(cmd)
+        return bool(tokens) and tokens[0].lower() == 'cd' and not any(token in {'&', '&&', '|', '||', ';'} for token in tokens)
+
+    def _change_directory_and_respond(self, client_id, cmd):
+        client = self.clients.get(client_id)
+        if not client:
+            return
+
+        tokens = self._split_command(cmd)
+        args = tokens[1:]
+        if os.name == 'nt' and args and args[0].lower() == '/d':
+            args = args[1:]
+
+        if not args:
+            target = os.path.expanduser('~')
+        else:
+            target = ' '.join(args).strip('"\'')
+            target = os.path.expandvars(os.path.expanduser(target))
+            if not os.path.isabs(target):
+                target = os.path.join(client.cwd, target)
+
+        try:
+            new_cwd = os.path.abspath(target)
+            if not os.path.isdir(new_cwd):
+                output = f"cd: no such file or directory: {target}\n"
+            else:
+                client.cwd = new_cwd
+                output = ''
+        except Exception as e:
+            output = f"cd: {e}\n"
+
+        if client_id in self.clients:
+            self._send_reliable(client_id, output.encode('utf-8'))
 
     def _decode_output(self, data):
         if not data:
@@ -180,6 +231,7 @@ class UDPServer:
                     ['cmd.exe', '/c', cmd],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    cwd=client.cwd,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
                 )
             else:
@@ -187,6 +239,7 @@ class UDPServer:
                     ['bash', '-c', cmd],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    cwd=client.cwd,
                     preexec_fn=os.setsid
                 )
 

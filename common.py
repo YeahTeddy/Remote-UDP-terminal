@@ -14,6 +14,7 @@ MAX_DATA_SIZE = 1472 - HEADER_SIZE
 MAX_SEQUENCE = 0xFFFFFFFF
 DATA_SEQUENCE_MOD = MAX_SEQUENCE
 HEARTBEAT_SEQ = MAX_SEQUENCE
+OUTPUT_DONE_PREFIX = b'\x00CWD:'
 
 
 def next_data_seq(seq: int) -> int:
@@ -30,6 +31,18 @@ def normalize_command_input(text: str) -> str:
         else:
             result.append(ch)
     return ''.join(result)
+
+
+def pack_output_done(cwd: str) -> bytes:
+    return OUTPUT_DONE_PREFIX + cwd.encode('utf-8')
+
+
+def unpack_output_done(data: bytes) -> str | None:
+    if data == b'':
+        return ''
+    if data.startswith(OUTPUT_DONE_PREFIX):
+        return data[len(OUTPUT_DONE_PREFIX):].decode('utf-8', errors='replace')
+    return None
 
 
 def pack_msg(msg_type: int, seq: int, client_id: int, data: bytes) -> bytes:

@@ -36,7 +36,7 @@ def recv_response(sock, cid, addr, timeout=5):
             elif resp[0] == TYPE_OUTPUT:
                 ack = pack_msg(TYPE_ACK, resp[1], cid, b'')
                 sock.sendto(ack, addr)
-                if not resp[3]:
+                if unpack_output_done(resp[3]) is not None:
                     break
                 all_data += resp[3]
                 sock.settimeout(1)
@@ -237,15 +237,25 @@ for _ in range(3):
 log_test("Unreachable timeout detected", not received)
 sock_un.close()
 
-# ===== Test 10: pwd/cd command =====
-print("\n[10] pwd/cd Command", flush=True)
+# ===== Test 10: Persistent cd command =====
+print("\n[10] Persistent cd Command", flush=True)
 cid_pwd = 10011
 sock_pwd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-cmd = 'cd' if os.name == 'nt' else 'pwd'
-sock_pwd.sendto(pack_msg(TYPE_COMMAND, 0, cid_pwd, cmd.encode('utf-8')), addr)
+expected_parent = os.path.abspath(os.path.join(os.getcwd(), '..'))
+show_cwd_cmd = 'echo %CD%' if os.name == 'nt' else 'pwd'
+
+sock_pwd.sendto(pack_msg(TYPE_COMMAND, 0, cid_pwd, b'cd ..'), addr)
+got_cd_ack, cd_out = recv_response(sock_pwd, cid_pwd, addr, timeout=5)
+log_test("cd ACK received", got_cd_ack)
+log_test("cd success has no output", len(cd_out) == 0, f"out={cd_out[:80]}")
+
+sock_pwd.sendto(pack_msg(TYPE_COMMAND, 1, cid_pwd, show_cwd_cmd.encode('utf-8')), addr)
 _, out_pwd = recv_response(sock_pwd, cid_pwd, addr, timeout=5)
-pwd_str = out_pwd.decode('utf-8', errors='replace')
-log_test(f"{cmd} has output", len(pwd_str.strip()) > 0, f"out={pwd_str[:80]}")
+pwd_str = out_pwd.decode('utf-8', errors='replace').strip()
+if os.name == 'nt':
+    log_test("cd affects later commands", os.path.normcase(pwd_str) == os.path.normcase(expected_parent), f"out={pwd_str}, expected={expected_parent}")
+else:
+    log_test("cd affects later commands", pwd_str == expected_parent, f"out={pwd_str}, expected={expected_parent}")
 sock_pwd.close()
 
 # ===== Stop server =====

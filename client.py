@@ -23,13 +23,18 @@ class UDPClient:
         self.print_lock = threading.Lock()
         self.prompt_user = getpass.getuser()
         self.prompt_host = server_host
+        self.prompt_dir = self._format_prompt_dir(os.getcwd())
         print(f"Client ID: {self.client_id}, connecting to {server_host}:{server_port}")
 
+    def _format_prompt_dir(self, path):
+        normalized = path.replace('\\', '/').rstrip('/')
+        if not normalized:
+            return '/'
+        return normalized.rsplit('/', 1)[-1]
+
     def _prompt(self):
-        cwd = os.getcwd().rstrip('\\/')
-        current_dir = os.path.basename(cwd) or cwd
         suffix = '#' if self.prompt_user in ('root', 'Administrator') else '$'
-        return f"[{self.prompt_user}@{self.prompt_host} {current_dir}]{suffix} "
+        return f"[{self.prompt_user}@{self.prompt_host} {self.prompt_dir}]{suffix} "
 
     def start(self):
         self.running = True
@@ -99,12 +104,15 @@ class UDPClient:
                         self.ack_event.set()
                 elif msg_type == TYPE_OUTPUT:
                     if seq == self.recv_expected_seq:
-                        if payload:
+                        done_cwd = unpack_output_done(payload)
+                        if done_cwd is not None:
+                            if done_cwd:
+                                self.prompt_dir = self._format_prompt_dir(done_cwd)
+                            self.output_done_event.set()
+                        else:
                             with self.print_lock:
                                 sys.stdout.write(payload.decode('utf-8', errors='replace'))
                                 sys.stdout.flush()
-                        else:
-                            self.output_done_event.set()
                         self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
                     ack_msg = pack_msg(TYPE_ACK, seq, self.client_id, b'')
                     self.sock.sendto(ack_msg, self.server_addr)
