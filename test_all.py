@@ -62,7 +62,7 @@ else:
 
 log_test("Magic matches guide", MAGIC == 0x5554)
 log_test("Header size matches guide", HEADER_SIZE == 13)
-log_test("Message types match guide", (TYPE_COMMAND, TYPE_OUTPUT, TYPE_ACK, TYPE_HEARTBEAT) == (0x01, 0x02, 0x03, 0x04))
+log_test("Message types match guide", (TYPE_COMMAND, TYPE_OUTPUT, TYPE_ACK, TYPE_HEARTBEAT, TYPE_INTERRUPT) == (0x01, 0x02, 0x03, 0x04, 0x05))
 
 fake_header = struct.pack(HEADER_FORMAT, 0xFFFF, TYPE_COMMAND, 0, 5, 1)
 log_test("Invalid magic rejected", unpack_msg(fake_header + b'hello') is None)
@@ -113,6 +113,23 @@ try:
 except socket.timeout:
     log_test("Heartbeat ACK received", False, "timeout")
 sock_hb.close()
+
+# ===== Test 2b: Client Connection Check =====
+print("\n[2b] Client Connection Check", flush=True)
+from client import UDPClient
+client_ok = UDPClient('127.0.0.1', TEST_PORT)
+client_ok.running = True
+threading.Thread(target=client_ok._recv_loop, daemon=True).start()
+log_test("Client startup detects reachable server", client_ok._connect_to_server(timeout=2))
+client_ok.running = False
+client_ok._close_socket()
+
+client_fail = UDPClient('127.0.0.1', 19999)
+client_fail.running = True
+threading.Thread(target=client_fail._recv_loop, daemon=True).start()
+log_test("Client startup rejects unreachable server", not client_fail._connect_to_server(timeout=0.5))
+client_fail.running = False
+client_fail._close_socket()
 
 # ===== Test 3: Command Execution =====
 print("\n[3] Command Execution", flush=True)

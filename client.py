@@ -4,6 +4,7 @@ import time
 import random
 import signal
 import sys
+import _thread
 from common import *
 
 
@@ -18,6 +19,8 @@ class UDPClient:
         self.recv_expected_seq = 0
         self.ack_event = threading.Event()
         self.output_done_event = threading.Event()
+        self.heartbeat_ack_event = threading.Event()
+        self.last_heartbeat_ack = 0
         self.waiting_seq = -1
         self.print_lock = threading.Lock()
         self.prompt_ready_event = threading.Event()
@@ -28,6 +31,8 @@ class UDPClient:
         self.suppress_interrupt_until = 0
         self.saved_sigint_handler = None
         self.resume_sigint_at = 0
+        self.connection_error_reported = False
+        self.connected = False
         print(f"Client ID: {self.client_id}, connecting to {server_host}:{server_port}")
 
     def _format_prompt_dir(self, path):
@@ -96,6 +101,8 @@ class UDPClient:
             try:
                 return self._send_reliable(data)
             except KeyboardInterrupt:
+                if not self.running:
+                    return False
                 if self._is_suppressed_interrupt():
                     continue
                 self._print_interrupt_marker()
@@ -107,54 +114,77 @@ class UDPClient:
         self.running = True
         recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         recv_thread.start()
-        self._send_heartbeat()
+        try:
+            connected = self._connect_to_server()
+        except KeyboardInterrupt:
+            self.running = False
+            self._close_socket()
+            return
+        if not connected:
+            self._safe_print(f"Connection failed: server {self.server_addr[0]}:{self.server_addr[1]} did not respond")
+            self.running = False
+            self._close_socket()
+            return
+
+        self.connected = True
         heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         heartbeat_thread.start()
         print("Connected to server, enter commands to execute, 'exit' to quit")
-        self._wait_for_prompt_info()
 
-        while self.running:
-            try:
-                self._resume_sigint()
-                cmd = input(self._prompt())
-            except KeyboardInterrupt:
-                self._handle_prompt_interrupt()
-                continue
-            except EOFError:
-                if sys.stdin.isatty():
+        try:
+            while self.running:
+                try:
+                    self._resume_sigint()
+                    cmd = input(self._prompt())
+                except KeyboardInterrupt:
+                    if not self.running:
+                        break
                     self._handle_prompt_interrupt()
                     continue
-                self.stop()
-                break
+                except EOFError:
+                    if sys.stdin.isatty():
+                        self._handle_prompt_interrupt()
+                        continue
+                    self.stop()
+                    break
 
-            if cmd.strip() == 'exit':
-                self.stop()
-                break
-            if not cmd.strip():
-                continue
+                if cmd.strip() == 'exit':
+                    self.stop()
+                    break
+                if not cmd.strip():
+                    continue
 
-            self.output_done_event.clear()
-            self._begin_command_interrupt_window()
-            sent = self._send_command_reliable((cmd + '\n').encode('utf-8'))
-            if sent:
-                while self.running and not self.output_done_event.is_set():
-                    try:
-                        self.output_done_event.wait(0.1)
-                    except KeyboardInterrupt:
-                        if self._is_suppressed_interrupt():
-                            continue
-                        self._print_interrupt_marker()
-                        self._send_interrupt()
+                self.output_done_event.clear()
+                self._begin_command_interrupt_window()
+                sent = self._send_command_reliable((cmd + '\n').encode('utf-8'))
+                if sent:
+                    while self.running and not self.output_done_event.is_set():
+                        try:
+                            self.output_done_event.wait(0.1)
+                        except KeyboardInterrupt:
+                            if not self.running:
+                                break
+                            if self._is_suppressed_interrupt():
+                                continue
+                            self._print_interrupt_marker()
+                            self._send_interrupt()
+        except KeyboardInterrupt:
+            if self.running:
+                self._handle_prompt_interrupt()
+
+    def _close_socket(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
     def stop(self):
         if not self.running:
             return
         self._resume_sigint()
         self.running = False
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        self.connected = False
+        self._close_socket()
         self._safe_print("\nClient stopped")
 
     def _send_interrupt(self):
@@ -168,19 +198,45 @@ class UDPClient:
         try:
             msg = pack_msg(TYPE_HEARTBEAT, HEARTBEAT_SEQ, self.client_id, b'')
             self.sock.sendto(msg, self.server_addr)
+            return True
         except Exception:
-            pass
+            return False
+
+    def _wait_for_heartbeat_ack(self, timeout=2):
+        self.heartbeat_ack_event.clear()
+        sent_at = time.monotonic()
+        if not self._send_heartbeat():
+            return False
+
+        deadline = sent_at + timeout
+        while self.running:
+            if self.last_heartbeat_ack >= sent_at:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.heartbeat_ack_event.wait(remaining)
+        return False
+
+    def _connect_to_server(self, timeout=2):
+        return self._wait_for_heartbeat_ack(timeout=timeout)
+
+    def _handle_connection_error(self):
+        if self.connection_error_reported:
+            return
+        self.connection_error_reported = True
+        self.running = False
+        self.connected = False
+        self._safe_print("\nConnection error: server did not respond to heartbeat, exiting")
+        self._close_socket()
+        _thread.interrupt_main()
 
     def _heartbeat_loop(self):
         while self.running:
             time.sleep(5)
-            self._send_heartbeat()
-
-    def _wait_for_prompt_info(self):
-        try:
-            self.prompt_ready_event.wait(timeout=2)
-        except KeyboardInterrupt:
-            self._handle_prompt_interrupt()
+            if self.running and not self._wait_for_heartbeat_ack(timeout=2):
+                self._handle_connection_error()
+                break
 
     def _apply_prompt_info(self, user, host, cwd):
         if user:
@@ -204,6 +260,9 @@ class UDPClient:
                     prompt_info = unpack_prompt_info(payload)
                     if prompt_info:
                         self._apply_prompt_info(*prompt_info)
+                    if seq == HEARTBEAT_SEQ:
+                        self.last_heartbeat_ack = time.monotonic()
+                        self.heartbeat_ack_event.set()
                     if seq == self.waiting_seq:
                         self.ack_event.set()
                 elif msg_type == TYPE_OUTPUT:
@@ -222,8 +281,11 @@ class UDPClient:
                     self.sock.sendto(ack_msg, self.server_addr)
             except socket.timeout:
                 continue
+            except (ConnectionResetError, OSError):
+                if self.running and self.connected:
+                    self._handle_connection_error()
             except Exception as e:
-                if self.running:
+                if self.running and self.connected:
                     print(f"\nRecv error: {e}")
 
     def _send_reliable(self, data):
