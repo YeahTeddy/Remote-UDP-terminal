@@ -226,6 +226,16 @@ _, encoding_out = recv_response(sock_encoding, cid_encoding, addr, timeout=5)
 encoding_str = encoding_out.decode('utf-8', errors='replace')
 log_test("Non-ASCII output decoded", "ENCODING_OK_编码" in encoding_str, f"out={encoding_str[:80]}")
 sock_encoding.close()
+
+cid_utf8_file = 10016
+sock_utf8_file = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+utf8_file_cmd = 'type README.md' if os.name == 'nt' else 'cat README.md'
+sock_utf8_file.sendto(pack_msg(TYPE_COMMAND, 0, cid_utf8_file, utf8_file_cmd.encode('utf-8')), addr)
+_, utf8_file_out = recv_response(sock_utf8_file, cid_utf8_file, addr, timeout=5)
+utf8_file_str = utf8_file_out.decode('utf-8', errors='replace')
+log_test("UTF-8 file output decoded", "UDP 远程终端" in utf8_file_str, f"out={utf8_file_str[:80]}")
+sock_utf8_file.close()
+
 time.sleep(0.3)
 
 print("\n[3b] Advanced Output", flush=True)

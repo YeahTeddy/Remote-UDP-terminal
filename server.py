@@ -314,16 +314,33 @@ class UDPServer:
 
     def _stream_pipe(self, client_id, pipe):
         try:
-            decoder = codecs.getincrementaldecoder(self.encoding)(errors='replace')
+            utf8_decoder = codecs.getincrementaldecoder('utf-8')(errors='strict')
+            local_decoder = codecs.getincrementaldecoder(self.encoding)(errors='replace')
+            use_utf8 = True
             read_chunk = pipe.read1 if hasattr(pipe, 'read1') else pipe.read
             while self.running:
                 chunk = read_chunk(4096)
                 if not chunk:
                     break
-                text = decoder.decode(chunk)
+                if use_utf8:
+                    pending = utf8_decoder.getstate()[0]
+                    try:
+                        text = utf8_decoder.decode(chunk)
+                    except UnicodeDecodeError:
+                        use_utf8 = False
+                        text = local_decoder.decode(pending + chunk)
+                else:
+                    text = local_decoder.decode(chunk)
                 if text and not self._send_output_reliable(client_id, text.encode('utf-8')):
                     break
-            tail = decoder.decode(b'', final=True)
+            if use_utf8:
+                pending = utf8_decoder.getstate()[0]
+                try:
+                    tail = utf8_decoder.decode(b'', final=True)
+                except UnicodeDecodeError:
+                    tail = local_decoder.decode(pending, final=True)
+            else:
+                tail = local_decoder.decode(b'', final=True)
             if tail:
                 self._send_output_reliable(client_id, tail.encode('utf-8'))
         except Exception as e:
