@@ -83,6 +83,8 @@ class UDPClient:
         self.prompt_user = 'user'
         self.prompt_host = server_host
         self.prompt_dir = '~'
+        self.server_session_id = None
+        self.waiting_for_output = False
         self.prompt_interrupt_seen = False
         self.suppress_interrupt_until = 0
         self.saved_sigint_handler = None
@@ -245,17 +247,21 @@ class UDPClient:
             self._shutdown_runtime()
 
     def _wait_for_command_output(self):
-        while self.running and not self.output_done_event.is_set():
-            try:
-                self.output_done_event.wait(0.1)
-            except KeyboardInterrupt:
-                if not self.running:
-                    break
-                if self._is_suppressed_interrupt():
-                    continue
-                if os.name != 'nt':
-                    self._print_interrupt_marker()
-                self._send_interrupt()
+        self.waiting_for_output = True
+        try:
+            while self.running and not self.output_done_event.is_set():
+                try:
+                    self.output_done_event.wait(0.1)
+                except KeyboardInterrupt:
+                    if not self.running:
+                        break
+                    if self._is_suppressed_interrupt():
+                        continue
+                    if os.name != 'nt':
+                        self._print_interrupt_marker()
+                    self._send_interrupt()
+        finally:
+            self.waiting_for_output = False
 
     def _close_socket(self):
         try:
@@ -337,6 +343,17 @@ class UDPClient:
         self._shutdown_runtime()
         _thread.interrupt_main()
 
+    def _handle_server_session_change(self):
+        self.send_seq = 0
+        self.recv_expected_seq = 0
+        if self.waiting_seq != -1:
+            self.waiting_seq = self.send_seq
+            self.ack_event.clear()
+        if self.waiting_for_output and not self.output_done_event.is_set():
+            self._restore_terminal_mode()
+            self._safe_print("\nServer restarted: current command output is no longer available")
+            self.output_done_event.set()
+
     def _heartbeat_loop(self):
         missed_heartbeats = 0
         max_missed_heartbeats = 3
@@ -354,7 +371,13 @@ class UDPClient:
                 self._handle_connection_error()
                 break
 
-    def _apply_prompt_info(self, user, host, cwd):
+    def _apply_prompt_info(self, user, host, cwd, server_session_id=''):
+        if server_session_id:
+            if self.server_session_id is None:
+                self.server_session_id = server_session_id
+            elif server_session_id != self.server_session_id:
+                self.server_session_id = server_session_id
+                self._handle_server_session_change()
         if user:
             self.prompt_user = user
         if host:
@@ -652,6 +675,7 @@ class UDPClient:
 
     def _run_interactive_until_done(self):
         self.interactive_mode = True
+        self.waiting_for_output = True
         self._enter_raw_mode()
         try:
             while self.running and not self.output_done_event.is_set():
@@ -676,6 +700,7 @@ class UDPClient:
         finally:
             self._restore_terminal_mode()
             self.interactive_mode = False
+            self.waiting_for_output = False
 
 
 if __name__ == '__main__':

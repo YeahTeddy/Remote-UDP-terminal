@@ -255,10 +255,12 @@ log_test("ANSI input normalized", normalize_command_input('echo \x1b[31mANSI_OK\
 print("\n[1c] High-Level Protocol Helpers", flush=True)
 resize_payload = pack_resize(40, 120)
 window_payload = pack_window_update(3, 4096)
+prompt_payload = pack_prompt_info('user', 'host', '/tmp', 'session-1')
 log_test("Resize payload roundtrip", unpack_resize(resize_payload) == (40, 120))
 log_test("Invalid resize rejected", unpack_resize(b'bad') is None)
 log_test("Window update roundtrip", unpack_window_update(window_payload) == (3, 4096))
 log_test("Invalid window update rejected", unpack_window_update(b'bad') is None)
+log_test("Prompt info carries server session", unpack_prompt_info(prompt_payload) == ('user', 'host', '/tmp', 'session-1'))
 log_test("PTY command prefix detected", should_use_pty_command('pty bash'))
 log_test("Fullscreen command detected", should_use_pty_command('vim README.md'))
 log_test("Ping command stays on normal path", not should_use_pty_command('ping 127.0.0.1'))
@@ -290,6 +292,7 @@ try:
     prompt_info = unpack_prompt_info(resp[3]) if resp else None
     log_test("Heartbeat ACK received", resp is not None and resp[0] == TYPE_ACK and resp[1] == HEARTBEAT_SEQ)
     log_test("Heartbeat carries prompt info", prompt_info is not None and len(prompt_info[0]) > 0 and len(prompt_info[1]) > 0 and prompt_info[2] == os.getcwd())
+    log_test("Heartbeat carries server session", prompt_info is not None and len(prompt_info[3]) > 0)
 except socket.timeout:
     log_test("Heartbeat ACK received", False, "timeout")
 sock_hb.close()
@@ -411,6 +414,29 @@ try:
     client_reconnect.output_done_event.set()
     log_test("Command wait continues after heartbeat reconnect", still_waiting_after_reconnect and reconnect_wait_finished.wait(1))
     client_reconnect._close_socket()
+
+    client_restart = UDPClient('127.0.0.1', TEST_PORT)
+    client_restart.running = True
+    client_restart.connected = True
+    client_restart.server_session_id = 'old-session'
+    client_restart.send_seq = 7
+    client_restart.recv_expected_seq = 9
+    restart_wait_finished = threading.Event()
+
+    def wait_for_restarted_command_output():
+        client_restart._wait_for_command_output()
+        restart_wait_finished.set()
+
+    threading.Thread(target=wait_for_restarted_command_output, daemon=True).start()
+    time.sleep(0.1)
+    client_restart._apply_prompt_info('user', 'host', os.getcwd(), 'new-session')
+    log_test(
+        "Command wait exits after server restart",
+        restart_wait_finished.wait(1)
+        and client_restart.send_seq == 0
+        and client_restart.recv_expected_seq == 0,
+    )
+    client_restart._close_socket()
 
     client_shutdown = UDPClient('127.0.0.1', TEST_PORT)
     client_shutdown.running = True
