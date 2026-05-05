@@ -57,7 +57,7 @@
 | 持续输出且会刷新 stdout/stderr 的命令 | Windows: `ping -n 5 127.0.0.1`；Linux/macOS: `ping 127.0.0.1` |
 | 大批量输出命令 | Windows: `for /L %i in (1,1,1000) do @echo XXXXXXXXXX`；Linux/macOS: `seq 1 1000` |
 | 查看文本文件 | Windows: `type README.md`；Linux/macOS: `cat README.md` |
-| 输出 ANSI 颜色文本 | `python -c "print('\\033[31mRED_TEXT\\033[0m')"`，客户端会显示过滤后的普通文本。 |
+| 输出 ANSI 颜色文本 | `python -c "print('\033[31mRED_TEXT\033[0m')"`，客户端会显示过滤后的普通文本。 |
 
 限制说明：
 
