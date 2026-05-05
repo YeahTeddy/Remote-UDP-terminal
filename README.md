@@ -72,9 +72,9 @@
 |---|---|
 | 滑动窗口流量控制 | 客户端根据乱序接收缓冲区剩余分片数和剩余字节数生成窗口通告；服务端发送窗口取固定输出窗口和客户端通告窗口的较小值。客户端缓冲区满时不会 ACK 未保存的输出分片，只发送窗口更新，避免服务端误判数据已可靠送达。 |
 | 终端窗口大小同步（WINCH） | 客户端连接成功、进入 PTY 命令前以及窗口大小变化时发送行列数；服务端按客户端 ID 保存 `rows/cols`，并在 PTY/ConPTY 会话存在时立即设置伪终端大小。 |
-| PTY/ConPTY 全屏交互 | 服务端普通命令路径保持不变；`pty <command>` 以及 `top`、`vim`、`vi`、`nano`、`less` 会进入 PTY 路径。客户端进入 raw 输入模式，把按键作为 `TYPE_STDIN` 原始字节发送；服务端写入对应客户端的 PTY，PTY 输出原样通过可靠输出链路返回客户端。 |
+| PTY/ConPTY 全屏交互 | 服务端普通命令路径保持不变；`pty <command>` 以及 `top`、`vim`、`vi`、`nano`、`less` 会进入 PTY 路径。POSIX 客户端进入 raw 输入模式发送原始按键字节；Windows 客户端使用 Console API 读取键盘事件，再将字符或特殊键转换为 `TYPE_STDIN` 发送；服务端写入对应客户端的 PTY，PTY 输出原样通过可靠输出链路返回客户端。 |
 | 全屏界面原样渲染 | PTY 模式输出不解码、不过滤 ANSI 转义序列，客户端直接写入本地 stdout buffer，因此光标移动、清屏、备用屏幕、界面刷新等控制序列可以正常工作。 |
-| Windows ConPTY 支持 | Windows 10/11 服务端通过可选依赖 `pywinpty` 使用原生 ConPTY；未安装时，非 PTY 普通命令不受影响，显式或自动 PTY 命令会返回明确错误提示。Windows PTY 输入支持 UTF-8 增量解码、退格 DEL 映射和按键/输出小批量合并，改善 `vim` 中文输入和编辑延迟。 |
+| Windows ConPTY 支持 | Windows 10/11 服务端通过可选依赖 `pywinpty` 使用原生 ConPTY；未安装时，非 PTY 普通命令不受影响，显式或自动 PTY 命令会返回明确错误提示。Windows PTY 输入使用 `ReadConsoleInputW` 读取 KeyDown 事件，跳过 IME 产生的空字符事件，将普通字符编码为 UTF-8、退格映射为 DEL、方向键等特殊键映射为 ANSI 序列，并通过 UTF-8 增量解码写入 ConPTY，改善 `vim` 中文输入和编辑延迟。 |
 | PTY 清理与隔离 | 每个客户端维护独立 PTY 会话、窗口大小、接收窗口和进程状态；心跳超时或客户端离线时，服务端会清理该客户端的 PTY/ConPTY 会话和当前进程。 |
 
 ### 3.2 拔高阶段支持的命令
@@ -90,7 +90,8 @@
 
 - Linux/macOS/WSL 服务端使用 Python 标准库 PTY，无需额外依赖即可支持 `top`、`vim` 等程序。
 - Windows 10/11 原生服务端通过可选依赖 `pywinpty` 支持 ConPTY，安装方式见“4.1 依赖安装”。
-- 非 TTY 环境无法进入完整 raw 输入模式，建议在真实终端中手动验证 `top`、`vim`、窗口缩放等交互行为。
+- POSIX 非 TTY 环境无法进入完整 raw 输入模式；Windows 客户端需要在真实控制台环境中读取完整键盘事件。建议在真实终端中手动验证 `top`、`vim`、窗口缩放等交互行为。
+- PTY stdin 为低延迟交互路径，客户端会按序号发送输入分片，服务端 ACK 并按序写入 PTY；客户端当前不等待 stdin ACK 重传，因此该方向不同于普通命令停等 ARQ 和输出滑动窗口可靠传输。
 - `pty bash` / `pty sh` 内部执行的 `cd` 只影响该交互 shell；退出后客户端提示符仍以服务端维护的普通命令 `cwd` 为准。需要持久切换目录时，仍建议在普通提示符下执行 `cd`。
 
 ## 四、使用方法
@@ -170,10 +171,12 @@ Remote-UDP-terminal/
 
 控制 payload：
 
-- `ACK` 可携带接收窗口通告，表示客户端确认当前输出分片后剩余的乱序接收缓冲空间。
-- `TYPE_WINDOW_UPDATE` 在没有新输出 ACK 时主动通告接收窗口变化。
-- `TYPE_RESIZE` 携带终端行列数，用于设置远端 PTY/ConPTY 大小。
-- `TYPE_STDIN` 携带 PTY 模式下的原始按键字节。
+- `ACK` 可携带接收窗口通告，表示客户端确认当前输出分片后剩余的乱序接收缓冲空间；该通告编码为 `b'\x00WIN:' + struct.pack('>H I', available_packets, available_bytes)`。
+- `TYPE_WINDOW_UPDATE` 在没有新输出 ACK 时主动通告接收窗口变化，payload 编码同 ACK 中的接收窗口通告。
+- `TYPE_RESIZE` 携带终端行列数，用于设置远端 PTY/ConPTY 大小；payload 编码为 `b'\x00SZ:' + struct.pack('>H H', rows, cols)`，行列范围均为 `1..1000`。
+- `TYPE_STDIN` 携带 PTY 模式下的终端输入字节；该方向服务端会回 ACK 并按序写入 PTY，但客户端不做停等重传，以优先保证交互延迟。
+- 输出结束标记作为 `TYPE_OUTPUT` 分片发送，payload 编码为 `b'\x00CWD:' + cwd.encode('utf-8')`，客户端据此更新下一次提示符目录并结束当前命令输出等待。
+- 心跳 ACK 可携带提示符信息，payload 编码为 `b'\x00PROMPT:' + '\0'.join((user, host, cwd)).encode('utf-8')`，客户端据此更新用户名、主机名和当前目录。
 
 ## 七、测试说明
 
@@ -198,6 +201,7 @@ python test_all.py
 - 大输出滑动窗口传输完整性。
 - 接收窗口通告、流量控制状态更新和小接收窗口下的大输出完整性。
 - 终端窗口大小同步报文和服务端 rows/cols 状态更新。
+- Windows PTY 输入辅助逻辑，包括退格 DEL 映射、中文 UTF-8 编码和代理对字符编码。
 - 简化 PTY 交互：Linux/macOS/WSL 下测试 `pty sh`；Windows 下若安装 `pywinpty` 则测试 `pty cmd`，否则验证缺少依赖时的明确错误提示。
 - 命令不存在、服务端不可达、非法报文不崩溃等异常场景。
 
