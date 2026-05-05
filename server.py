@@ -377,7 +377,6 @@ class UDPServer:
             return False
 
         with client.send_lock:
-            addr = client.addr
             packets = []
             for chunk in chunks:
                 seq = client.send_seq
@@ -400,6 +399,8 @@ class UDPServer:
             last_progress = time.monotonic()
             try:
                 while base < len(packets) and self.running:
+                    if client_id not in self.clients:
+                        return False
                     for packet in packets[base:next_to_send]:
                         if not packet['acked'] and packet['event'].is_set():
                             packet['acked'] = True
@@ -417,7 +418,7 @@ class UDPServer:
                     effective_window = self._get_effective_send_window(client)
                     while next_to_send < len(packets) and next_to_send - base < effective_window:
                         packet = packets[next_to_send]
-                        self._send_packet(client_id, addr, packet['seq'], packet['chunk'])
+                        self._send_packet(client_id, client.addr, packet['seq'], packet['chunk'])
                         packet['sent'] = True
                         packet['last_sent'] = time.monotonic()
                         next_to_send += 1
@@ -432,14 +433,12 @@ class UDPServer:
                         for packet in packets[base:next_to_send]:
                             if packet['acked']:
                                 continue
-                            if packet['retries'] >= MAX_RETRIES:
-                                print(f"Failed to send to client {client_id} after {MAX_RETRIES} retries")
-                                return False
                             packet['retries'] += 1
-                            self._send_packet(client_id, addr, packet['seq'], packet['chunk'])
+                            self._send_packet(client_id, client.addr, packet['seq'], packet['chunk'])
                             packet['last_sent'] = time.monotonic()
                             last_progress = time.monotonic()
-                            print(f"Retry {packet['retries']}/{MAX_RETRIES} for client {client_id} seq {packet['seq']}")
+                            if packet['retries'] % MAX_RETRIES == 0:
+                                print(f"Retry {packet['retries']} for client {client_id} seq {packet['seq']}")
                         continue
 
                     if next_to_send == base and effective_window <= 0:
@@ -569,7 +568,7 @@ class UDPServer:
             end += 1
         return text[:end], True
 
-    def _stream_pipe(self, client_id, pipe, cmd=None):
+    def _stream_pipe(self, client_id, pipe, cmd=None, output_failed_event=None):
         try:
             utf8_decoder = codecs.getincrementaldecoder('utf-8')(errors='strict')
             local_decoder = codecs.getincrementaldecoder(self.encoding)(errors='replace')
@@ -592,10 +591,13 @@ class UDPServer:
                 if os.name == 'nt':
                     text, interrupted = self._normalize_interrupt_text(text, suppress_after_interrupt)
                     if interrupted:
-                        if text:
-                            self._send_output_reliable(client_id, text.encode('utf-8'))
+                        if text and not self._send_output_reliable(client_id, text.encode('utf-8')):
+                            if output_failed_event is not None:
+                                output_failed_event.set()
                         break
                 if text and not self._send_output_reliable(client_id, text.encode('utf-8')):
+                    if output_failed_event is not None:
+                        output_failed_event.set()
                     break
             if use_utf8:
                 pending = utf8_decoder.getstate()[0]
@@ -607,8 +609,9 @@ class UDPServer:
                 tail = local_decoder.decode(b'', final=True)
             if os.name == 'nt':
                 tail, _ = self._normalize_interrupt_text(tail, suppress_after_interrupt)
-            if tail:
-                self._send_output_reliable(client_id, tail.encode('utf-8'))
+            if tail and not self._send_output_reliable(client_id, tail.encode('utf-8')):
+                if output_failed_event is not None:
+                    output_failed_event.set()
         except Exception as e:
             if self.running:
                 print(f"Stream error: {e}")
@@ -625,6 +628,7 @@ class UDPServer:
 
         proc = None
         reader_threads = []
+        output_failed_event = threading.Event()
         try:
             if os.name == 'nt':
                 proc = subprocess.Popen(
@@ -651,11 +655,15 @@ class UDPServer:
             for pipe in (proc.stdout, proc.stderr):
                 if pipe is None:
                     continue
-                thread = threading.Thread(target=self._stream_pipe, args=(client_id, pipe, cmd), daemon=True)
+                thread = threading.Thread(target=self._stream_pipe, args=(client_id, pipe, cmd, output_failed_event), daemon=True)
                 thread.start()
                 reader_threads.append(thread)
 
-            proc.wait()
+            while proc.poll() is None:
+                if output_failed_event.is_set():
+                    self._kill_process_tree(proc)
+                    break
+                time.sleep(0.1)
 
             for thread in reader_threads:
                 thread.join()

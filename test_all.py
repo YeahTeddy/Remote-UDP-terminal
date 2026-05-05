@@ -332,6 +332,7 @@ sock_state.close()
 
 # ===== Test 2b: Client Connection Check =====
 print("\n[2b] Client Connection Check", flush=True)
+import client as client_module
 from client import UDPClient
 client_ok = UDPClient('127.0.0.1', TEST_PORT)
 log_test("Windows PTY Backspace maps to DEL", os.name != 'nt' or client_ok._windows_char_to_input_bytes('\b') == b'\x7f')
@@ -353,6 +354,123 @@ threading.Thread(target=client_fail._recv_loop, daemon=True).start()
 log_test("Client startup rejects unreachable server", not client_fail._connect_to_server(timeout=0.5))
 client_fail.running = False
 client_fail._close_socket()
+
+original_interrupt_main = client_module._thread.interrupt_main
+client_module._thread.interrupt_main = lambda: None
+try:
+    client_wait = UDPClient('127.0.0.1', 19999)
+    client_wait.running = True
+    client_wait.connected = True
+    wait_finished = threading.Event()
+
+    def wait_for_command_output():
+        client_wait._wait_for_command_output()
+        wait_finished.set()
+
+    threading.Thread(target=wait_for_command_output, daemon=True).start()
+    time.sleep(0.1)
+    client_wait._handle_connection_error()
+    log_test("Command output wait exits on connection error", wait_finished.wait(1))
+    client_wait._close_socket()
+
+    client_send = UDPClient('127.0.0.1', 19999)
+    client_send.running = True
+    client_send.connected = True
+    send_finished = threading.Event()
+    send_result = []
+
+    def send_command_without_ack():
+        send_result.append(client_send._send_reliable(b'echo blocked\n'))
+        send_finished.set()
+
+    threading.Thread(target=send_command_without_ack, daemon=True).start()
+    time.sleep(0.1)
+    client_send._handle_connection_error()
+    log_test("Command send wait exits on connection error", send_finished.wait(1) and send_result == [False])
+    client_send._close_socket()
+
+    client_reconnect = UDPClient('127.0.0.1', TEST_PORT)
+    client_reconnect.running = True
+    client_reconnect.connected = True
+    reconnect_wait_finished = threading.Event()
+    reconnect_interrupt_sent = threading.Event()
+    reconnect_interrupts = []
+
+    def send_reconnect_interrupt():
+        reconnect_interrupts.append(True)
+        reconnect_interrupt_sent.set()
+
+    client_reconnect._send_interrupt = send_reconnect_interrupt
+
+    def wait_for_reconnected_command_output():
+        client_reconnect._wait_for_command_output()
+        reconnect_wait_finished.set()
+
+    threading.Thread(target=wait_for_reconnected_command_output, daemon=True).start()
+    time.sleep(0.1)
+    client_reconnect._mark_command_connection_interrupted()
+    client_reconnect.last_heartbeat_ack = time.monotonic()
+    interrupt_sent = reconnect_interrupt_sent.wait(1)
+    client_reconnect.output_done_event.set()
+    log_test("Command wait interrupts after heartbeat reconnect", interrupt_sent and reconnect_wait_finished.wait(1) and len(reconnect_interrupts) >= 1)
+    client_reconnect._close_socket()
+
+    client_reconnect_timeout = UDPClient('127.0.0.1', TEST_PORT)
+    client_reconnect_timeout.running = True
+    client_reconnect_timeout.connected = True
+    reconnect_timeout_finished = threading.Event()
+    reconnect_timeout_interrupt_sent = threading.Event()
+
+    def send_reconnect_timeout_interrupt():
+        reconnect_timeout_interrupt_sent.set()
+
+    client_reconnect_timeout._send_interrupt = send_reconnect_timeout_interrupt
+
+    def wait_for_reconnected_command_timeout():
+        client_reconnect_timeout._wait_for_command_output()
+        reconnect_timeout_finished.set()
+
+    threading.Thread(target=wait_for_reconnected_command_timeout, daemon=True).start()
+    time.sleep(0.1)
+    client_reconnect_timeout._mark_command_connection_interrupted()
+    client_reconnect_timeout.last_heartbeat_ack = time.monotonic()
+    timeout_interrupt_sent = reconnect_timeout_interrupt_sent.wait(1)
+    client_reconnect_timeout.reconnect_interrupt_started_at = time.monotonic() - 3.1
+    log_test("Command wait returns if reconnect interrupt gets no completion", timeout_interrupt_sent and reconnect_timeout_finished.wait(1))
+    client_reconnect_timeout._close_socket()
+
+    client_shutdown = UDPClient('127.0.0.1', TEST_PORT)
+    client_shutdown.running = True
+    client_shutdown.stop_event.clear()
+    client_shutdown.recv_thread = threading.Thread(target=lambda: client_shutdown.stop_event.wait(5))
+    client_shutdown.heartbeat_thread = threading.Thread(target=lambda: client_shutdown.stop_event.wait(5))
+    client_shutdown.recv_thread.start()
+    client_shutdown.heartbeat_thread.start()
+    client_shutdown._shutdown_runtime()
+    log_test("Client shutdown joins background threads", not client_shutdown.recv_thread.is_alive() and not client_shutdown.heartbeat_thread.is_alive())
+
+    class InterruptingJoinThread:
+        def __init__(self):
+            self.join_called = False
+
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            self.join_called = True
+            raise KeyboardInterrupt
+
+    client_shutdown_interrupt = UDPClient('127.0.0.1', TEST_PORT)
+    client_shutdown_interrupt.running = True
+    client_shutdown_interrupt.recv_thread = InterruptingJoinThread()
+    try:
+        client_shutdown_interrupt._shutdown_runtime()
+        shutdown_interrupt_handled = True
+    except KeyboardInterrupt:
+        shutdown_interrupt_handled = False
+    log_test("Client shutdown ignores internal interrupt during join", shutdown_interrupt_handled and client_shutdown_interrupt.recv_thread.join_called)
+finally:
+    client_module._thread.interrupt_main = original_interrupt_main
 
 # ===== Test 3: Command Execution =====
 print("\n[3] Command Execution", flush=True)
@@ -425,6 +543,83 @@ sock_flow.sendto(pack_msg(TYPE_COMMAND, 0, cid_flow, large_cmd.encode('utf-8')),
 _, flow_out = recv_response_with_window(sock_flow, cid_flow, addr, advertised_packets=1, timeout=8)
 log_test("Large output with advertised receive window complete", flow_out.count(b'X') >= 8000, f"len={len(flow_out)}")
 sock_flow.close()
+
+cid_outage = 10022
+sock_outage = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock_outage.settimeout(1)
+sock_outage.sendto(pack_msg(TYPE_HEARTBEAT, HEARTBEAT_SEQ, cid_outage, b''), addr)
+try:
+    sock_outage.recvfrom(1500)
+except socket.timeout:
+    pass
+outage_result = []
+outage_finished = threading.Event()
+
+
+def send_output_during_ack_outage():
+    outage_result.append(server._send_output_reliable(cid_outage, b'OUTAGE_OK'))
+    outage_finished.set()
+
+
+threading.Thread(target=send_output_during_ack_outage, daemon=True).start()
+time.sleep(ACK_TIMEOUT * (MAX_RETRIES + 2))
+log_test("Output send waits through transient ACK outage", not outage_finished.is_set())
+outage_payload_seen = False
+end = time.monotonic() + 3
+while not outage_finished.is_set() and time.monotonic() < end:
+    try:
+        resp_data, _ = sock_outage.recvfrom(65535)
+    except socket.timeout:
+        continue
+    resp = unpack_msg(resp_data)
+    if resp is None or resp[0] != TYPE_OUTPUT:
+        continue
+    outage_payload_seen = outage_payload_seen or resp[3] == b'OUTAGE_OK'
+    sock_outage.sendto(pack_msg(TYPE_ACK, resp[1], cid_outage, pack_window_update(OUTPUT_WINDOW_SIZE, RECV_BUFFER_LIMIT_BYTES)), addr)
+log_test("Output send recovers after transient ACK outage", outage_finished.wait(1) and outage_result == [True] and outage_payload_seen)
+sock_outage.close()
+
+cid_rebind = 10023
+sock_rebind_old = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock_rebind_old.settimeout(0.2)
+sock_rebind_old.sendto(pack_msg(TYPE_HEARTBEAT, HEARTBEAT_SEQ, cid_rebind, b''), addr)
+try:
+    sock_rebind_old.recvfrom(1500)
+except socket.timeout:
+    pass
+rebind_result = []
+rebind_finished = threading.Event()
+
+
+def send_output_to_rebound_client():
+    rebind_result.append(server._send_output_reliable(cid_rebind, b'REBIND_OK'))
+    rebind_finished.set()
+
+
+threading.Thread(target=send_output_to_rebound_client, daemon=True).start()
+time.sleep(ACK_TIMEOUT * 2)
+sock_rebind_old.close()
+sock_rebind_new = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock_rebind_new.settimeout(1)
+sock_rebind_new.sendto(pack_msg(TYPE_HEARTBEAT, HEARTBEAT_SEQ, cid_rebind, b''), addr)
+try:
+    sock_rebind_new.recvfrom(1500)
+except socket.timeout:
+    pass
+rebind_payload_seen = False
+end = time.monotonic() + 3
+while not rebind_finished.is_set() and time.monotonic() < end:
+    try:
+        resp_data, _ = sock_rebind_new.recvfrom(65535)
+    except socket.timeout:
+        continue
+    resp = unpack_msg(resp_data)
+    if resp is None or resp[0] != TYPE_OUTPUT:
+        continue
+    rebind_payload_seen = rebind_payload_seen or resp[3] == b'REBIND_OK'
+    sock_rebind_new.sendto(pack_msg(TYPE_ACK, resp[1], cid_rebind, pack_window_update(OUTPUT_WINDOW_SIZE, RECV_BUFFER_LIMIT_BYTES)), addr)
+log_test("Output retransmit uses rebound client address", rebind_finished.wait(1) and rebind_result == [True] and rebind_payload_seen)
+sock_rebind_new.close()
 time.sleep(0.3)
 
 # ===== Test 4: Multiple Clients =====
