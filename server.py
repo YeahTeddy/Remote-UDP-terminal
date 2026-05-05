@@ -363,11 +363,12 @@ class UDPServer:
         try:
             if os.name == 'nt':
                 proc = subprocess.Popen(
-                    ['cmd.exe', '/c', cmd],
+                    cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     cwd=client.cwd,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                    shell=True
                 )
             else:
                 proc = subprocess.Popen(

@@ -236,6 +236,15 @@ utf8_file_str = utf8_file_out.decode('utf-8', errors='replace')
 log_test("UTF-8 file output decoded", "UDP 远程终端" in utf8_file_str, f"out={utf8_file_str[:80]}")
 sock_utf8_file.close()
 
+cid_quote = 10017
+sock_quote = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+quote_cmd = 'python -c "print(\'\\033[31mQUOTE_OK\\033[0m\')"'
+sock_quote.sendto(pack_msg(TYPE_COMMAND, 0, cid_quote, quote_cmd.encode('utf-8')), addr)
+_, quote_out = recv_response(sock_quote, cid_quote, addr, timeout=5)
+quote_str = quote_out.decode('utf-8', errors='replace')
+log_test("Quoted python command executed", "QUOTE_OK" in quote_str, f"out={quote_str[:80]}")
+sock_quote.close()
+
 time.sleep(0.3)
 
 print("\n[3b] Advanced Output", flush=True)
