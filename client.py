@@ -69,8 +69,6 @@ class UDPClient:
         self.running = False
         self.send_seq = 0
         self.recv_expected_seq = 0
-        self.recv_buffer = {}
-        self.recv_buffer_bytes = 0
         self.recv_buffer_limit_packets = RECV_BUFFER_LIMIT_PACKETS
         self.recv_buffer_limit_bytes = RECV_BUFFER_LIMIT_BYTES
         self.ack_event = threading.Event()
@@ -79,7 +77,6 @@ class UDPClient:
         self.last_heartbeat_ack = 0
         self.waiting_seq = -1
         self.stdin_seq = DATA_SEQUENCE_MOD // 3
-        self.window_update_seq = DATA_SEQUENCE_MOD // 2
         self.resize_seq = DATA_SEQUENCE_MOD * 2 // 3
         self.print_lock = threading.Lock()
         self.prompt_ready_event = threading.Event()
@@ -367,21 +364,13 @@ class UDPClient:
         self.prompt_ready_event.set()
 
     def _available_recv_window_packets(self):
-        return max(0, self.recv_buffer_limit_packets - len(self.recv_buffer))
+        return self.recv_buffer_limit_packets
 
     def _available_recv_window_bytes(self):
-        return max(0, self.recv_buffer_limit_bytes - self.recv_buffer_bytes)
+        return self.recv_buffer_limit_bytes
 
     def _make_window_update_payload(self):
         return pack_window_update(self._available_recv_window_packets(), self._available_recv_window_bytes())
-
-    def _send_window_update(self):
-        try:
-            msg = pack_msg(TYPE_WINDOW_UPDATE, self.window_update_seq, self.client_id, self._make_window_update_payload())
-            self.sock.sendto(msg, self.server_addr)
-            self.window_update_seq = next_data_seq(self.window_update_seq)
-        except Exception:
-            pass
 
     def _process_output_payload(self, payload):
         done_cwd = unpack_output_done(payload)
@@ -408,23 +397,8 @@ class UDPClient:
         if seq == self.recv_expected_seq:
             self._process_output_payload(payload)
             self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
-            while self.recv_expected_seq in self.recv_buffer:
-                buffered_payload = self.recv_buffer.pop(self.recv_expected_seq)
-                self.recv_buffer_bytes -= len(buffered_payload)
-                self._process_output_payload(buffered_payload)
-                self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
-            return True
-        if is_sequence_ahead(seq, self.recv_expected_seq):
-            if seq in self.recv_buffer:
-                return True
-            if len(self.recv_buffer) >= self.recv_buffer_limit_packets:
-                return False
-            if self.recv_buffer_bytes + len(payload) > self.recv_buffer_limit_bytes:
-                return False
-            self.recv_buffer[seq] = payload
-            self.recv_buffer_bytes += len(payload)
-            return True
-        return True
+            return seq
+        return (self.recv_expected_seq - 1) % DATA_SEQUENCE_MOD
 
     def _recv_loop(self):
         while self.running:
@@ -445,12 +419,9 @@ class UDPClient:
                     if seq == self.waiting_seq:
                         self.ack_event.set()
                 elif msg_type == TYPE_OUTPUT:
-                    accepted = self._handle_output_packet(seq, payload)
-                    if accepted:
-                        ack_msg = pack_msg(TYPE_ACK, seq, self.client_id, self._make_window_update_payload())
-                        self.sock.sendto(ack_msg, self.server_addr)
-                    else:
-                        self._send_window_update()
+                    ack_seq = self._handle_output_packet(seq, payload)
+                    ack_msg = pack_msg(TYPE_ACK, ack_seq, self.client_id, self._make_window_update_payload())
+                    self.sock.sendto(ack_msg, self.server_addr)
             except socket.timeout:
                 continue
             except (ConnectionResetError, OSError):

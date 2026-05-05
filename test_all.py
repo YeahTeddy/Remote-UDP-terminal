@@ -30,7 +30,6 @@ def recv_response(sock, cid, addr, timeout=5):
     got_ack = False
     all_data = b''
     expected = recv_expected.get(cid, 0)
-    buffered = {}
     done = False
 
     def process_payload(payload):
@@ -52,16 +51,13 @@ def recv_response(sock, cid, addr, timeout=5):
             elif resp[0] == TYPE_OUTPUT:
                 seq = resp[1]
                 payload = resp[3]
-                ack = pack_msg(TYPE_ACK, seq, cid, b'')
-                sock.sendto(ack, addr)
                 if seq == expected:
                     process_payload(payload)
+                    ack_seq = seq
                     expected = next_data_seq(expected)
-                    while expected in buffered and not done:
-                        process_payload(buffered.pop(expected))
-                        expected = next_data_seq(expected)
-                elif is_sequence_ahead(seq, expected):
-                    buffered.setdefault(seq, payload)
+                else:
+                    ack_seq = (expected - 1) % DATA_SEQUENCE_MOD
+                sock.sendto(pack_msg(TYPE_ACK, ack_seq, cid, b''), addr)
                 sock.settimeout(1)
     except socket.timeout:
         pass
@@ -74,7 +70,6 @@ def recv_realtime_response(sock, cid, addr, timeout=5):
     all_data = b''
     first_output_at = None
     expected = recv_expected.get(cid, 0)
-    buffered = {}
     done = False
     started = time.monotonic()
 
@@ -99,16 +94,13 @@ def recv_realtime_response(sock, cid, addr, timeout=5):
             elif resp[0] == TYPE_OUTPUT:
                 seq = resp[1]
                 payload = resp[3]
-                ack = pack_msg(TYPE_ACK, seq, cid, b'')
-                sock.sendto(ack, addr)
                 if seq == expected:
                     process_payload(payload)
+                    ack_seq = seq
                     expected = next_data_seq(expected)
-                    while expected in buffered and not done:
-                        process_payload(buffered.pop(expected))
-                        expected = next_data_seq(expected)
-                elif is_sequence_ahead(seq, expected):
-                    buffered.setdefault(seq, payload)
+                else:
+                    ack_seq = (expected - 1) % DATA_SEQUENCE_MOD
+                sock.sendto(pack_msg(TYPE_ACK, ack_seq, cid, b''), addr)
                 sock.settimeout(3)
     except socket.timeout:
         pass
@@ -120,7 +112,6 @@ def recv_response_with_window(sock, cid, addr, advertised_packets=1, timeout=5):
     got_ack = False
     all_data = b''
     expected = recv_expected.get(cid, 0)
-    buffered = {}
     done = False
 
     def process_payload(payload):
@@ -143,16 +134,13 @@ def recv_response_with_window(sock, cid, addr, advertised_packets=1, timeout=5):
                 seq = resp[1]
                 payload = resp[3]
                 ack_payload = pack_window_update(advertised_packets, RECV_BUFFER_LIMIT_BYTES)
-                ack = pack_msg(TYPE_ACK, seq, cid, ack_payload)
-                sock.sendto(ack, addr)
                 if seq == expected:
                     process_payload(payload)
+                    ack_seq = seq
                     expected = next_data_seq(expected)
-                    while expected in buffered and not done:
-                        process_payload(buffered.pop(expected))
-                        expected = next_data_seq(expected)
-                elif is_sequence_ahead(seq, expected):
-                    buffered.setdefault(seq, payload)
+                else:
+                    ack_seq = (expected - 1) % DATA_SEQUENCE_MOD
+                sock.sendto(pack_msg(TYPE_ACK, ack_seq, cid, ack_payload), addr)
                 sock.settimeout(1)
     except socket.timeout:
         pass
@@ -165,7 +153,6 @@ def recv_pty_response(sock, cid, addr, stdin_data, timeout=8, send_after_output=
     stdin_sent = False
     all_data = b''
     expected = recv_expected.get(cid, 0)
-    buffered = {}
     done = False
     stdin_seq = 0
 
@@ -203,15 +190,13 @@ def recv_pty_response(sock, cid, addr, stdin_data, timeout=8, send_after_output=
                 if send_after_output:
                     send_stdin_once()
                 ack_payload = pack_window_update(OUTPUT_WINDOW_SIZE, RECV_BUFFER_LIMIT_BYTES)
-                sock.sendto(pack_msg(TYPE_ACK, seq, cid, ack_payload), addr)
                 if seq == expected:
                     process_payload(payload)
+                    ack_seq = seq
                     expected = next_data_seq(expected)
-                    while expected in buffered and not done:
-                        process_payload(buffered.pop(expected))
-                        expected = next_data_seq(expected)
-                elif is_sequence_ahead(seq, expected):
-                    buffered.setdefault(seq, payload)
+                else:
+                    ack_seq = (expected - 1) % DATA_SEQUENCE_MOD
+                sock.sendto(pack_msg(TYPE_ACK, ack_seq, cid, ack_payload), addr)
                 sock.settimeout(timeout)
     except socket.timeout:
         pass
@@ -342,6 +327,22 @@ if os.name == 'nt':
     log_test("Windows PTY surrogate pair encoded", client_ok._windows_char_to_input_bytes('\ude00') == '😀'.encode('utf-8'))
 else:
     log_test("Windows PTY surrogate pair encoded", True, "non-Windows")
+
+client_gbn = UDPClient('127.0.0.1', TEST_PORT)
+gbn_processed = []
+client_gbn._process_output_payload = gbn_processed.append
+ack_out_of_order = client_gbn._handle_output_packet(1, b'second')
+ack_first = client_gbn._handle_output_packet(0, b'first')
+ack_second = client_gbn._handle_output_packet(1, b'second')
+log_test(
+    "Go-Back-N client drops out-of-order output",
+    gbn_processed == [b'first', b'second']
+    and ack_out_of_order == (0 - 1) % DATA_SEQUENCE_MOD
+    and ack_first == 0
+    and ack_second == 1,
+)
+client_gbn._close_socket()
+
 client_ok.running = True
 threading.Thread(target=client_ok._recv_loop, daemon=True).start()
 log_test("Client startup detects reachable server", client_ok._connect_to_server(timeout=2))
@@ -705,10 +706,12 @@ if os.name == 'nt':
             elif resp[0] == TYPE_OUTPUT:
                 seq = resp[1]
                 payload = resp[3]
-                sock_ping.sendto(pack_msg(TYPE_ACK, seq, cid_ping, pack_window_update(OUTPUT_WINDOW_SIZE, RECV_BUFFER_LIMIT_BYTES)), addr)
                 if seq != expected:
+                    ack_seq = (expected - 1) % DATA_SEQUENCE_MOD
+                    sock_ping.sendto(pack_msg(TYPE_ACK, ack_seq, cid_ping, pack_window_update(OUTPUT_WINDOW_SIZE, RECV_BUFFER_LIMIT_BYTES)), addr)
                     continue
                 expected = next_data_seq(expected)
+                sock_ping.sendto(pack_msg(TYPE_ACK, seq, cid_ping, pack_window_update(OUTPUT_WINDOW_SIZE, RECV_BUFFER_LIMIT_BYTES)), addr)
                 if unpack_output_done(payload) is not None:
                     ping_done = True
                     continue

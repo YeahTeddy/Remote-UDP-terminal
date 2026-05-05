@@ -401,10 +401,14 @@ class UDPServer:
                 while base < len(packets) and self.running:
                     if client_id not in self.clients:
                         return False
-                    for packet in packets[base:next_to_send]:
-                        if not packet['acked'] and packet['event'].is_set():
+                    ack_to = None
+                    for index in range(base, next_to_send):
+                        if packets[index]['event'].is_set():
+                            ack_to = index
+                    if ack_to is not None:
+                        for packet in packets[base:ack_to + 1]:
                             packet['acked'] = True
-                            last_progress = time.monotonic()
+                        last_progress = time.monotonic()
 
                     while base < len(packets) and packets[base]['acked']:
                         with self.ack_lock:
@@ -425,14 +429,13 @@ class UDPServer:
                         last_progress = time.monotonic()
 
                     now = time.monotonic()
-                    timed_out = any(
-                        not packet['acked'] and packet['sent'] and now - packet['last_sent'] >= ACK_TIMEOUT
-                        for packet in packets[base:next_to_send]
+                    timed_out = (
+                        next_to_send > base
+                        and packets[base]['sent']
+                        and now - packets[base]['last_sent'] >= ACK_TIMEOUT
                     )
                     if timed_out:
                         for packet in packets[base:next_to_send]:
-                            if packet['acked']:
-                                continue
                             packet['retries'] += 1
                             self._send_packet(client_id, client.addr, packet['seq'], packet['chunk'])
                             packet['last_sent'] = time.monotonic()
