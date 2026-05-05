@@ -1,3 +1,4 @@
+import codecs
 import socket
 import threading
 import time
@@ -20,6 +21,7 @@ class ClientInfo:
         self.cwd = os.getcwd()
         self.current_process = None
         self.process_lock = threading.Lock()
+        self.send_lock = threading.Lock()
 
 
 class UDPServer:
@@ -137,47 +139,106 @@ class UDPServer:
         if proc and proc.poll() is None:
             self._interrupt_process(proc)
 
+    def _send_packet(self, client_id, addr, seq, chunk):
+        msg = pack_msg(TYPE_OUTPUT, seq, client_id, chunk)
+        self.sock.sendto(msg, addr)
+
+    def _send_output_chunks_reliable(self, client_id, chunks):
+        if not chunks:
+            return True
+
+        client = self.clients.get(client_id)
+        if not client:
+            return False
+
+        with client.send_lock:
+            addr = client.addr
+            packets = []
+            for chunk in chunks:
+                seq = client.send_seq
+                ack_event = threading.Event()
+                with self.ack_lock:
+                    self.ack_events[(client_id, seq)] = ack_event
+                packets.append({
+                    'seq': seq,
+                    'chunk': chunk,
+                    'event': ack_event,
+                    'sent': False,
+                    'acked': False,
+                    'retries': 0,
+                    'last_sent': 0.0,
+                })
+                client.send_seq = next_data_seq(client.send_seq)
+
+            base = 0
+            next_to_send = 0
+            try:
+                while base < len(packets) and self.running:
+                    while next_to_send < len(packets) and next_to_send - base < OUTPUT_WINDOW_SIZE:
+                        packet = packets[next_to_send]
+                        self._send_packet(client_id, addr, packet['seq'], packet['chunk'])
+                        packet['sent'] = True
+                        packet['last_sent'] = time.monotonic()
+                        next_to_send += 1
+
+                    for packet in packets[base:next_to_send]:
+                        if not packet['acked'] and packet['event'].is_set():
+                            packet['acked'] = True
+
+                    while base < len(packets) and packets[base]['acked']:
+                        with self.ack_lock:
+                            self.ack_events.pop((client_id, packets[base]['seq']), None)
+                        base += 1
+
+                    if base >= len(packets):
+                        return True
+
+                    now = time.monotonic()
+                    timed_out = any(
+                        not packet['acked'] and packet['sent'] and now - packet['last_sent'] >= ACK_TIMEOUT
+                        for packet in packets[base:next_to_send]
+                    )
+                    if not timed_out:
+                        time.sleep(0.01)
+                        continue
+
+                    for packet in packets[base:next_to_send]:
+                        if packet['acked']:
+                            continue
+                        if packet['retries'] >= MAX_RETRIES:
+                            print(f"Failed to send to client {client_id} after {MAX_RETRIES} retries")
+                            return False
+                        packet['retries'] += 1
+                        self._send_packet(client_id, addr, packet['seq'], packet['chunk'])
+                        packet['last_sent'] = time.monotonic()
+                        print(f"Retry {packet['retries']}/{MAX_RETRIES} for client {client_id} seq {packet['seq']}")
+            except Exception as e:
+                print(f"Send error: {e}")
+                return False
+            finally:
+                with self.ack_lock:
+                    for packet in packets:
+                        self.ack_events.pop((client_id, packet['seq']), None)
+
+        return False
+
+    def _send_output_reliable(self, client_id, data):
+        chunks = [data[i:i + MAX_DATA_SIZE] for i in range(0, len(data), MAX_DATA_SIZE)]
+        return self._send_output_chunks_reliable(client_id, chunks)
+
+    def _send_output_done(self, client_id):
+        client = self.clients.get(client_id)
+        if not client:
+            return False
+        return self._send_output_chunks_reliable(client_id, [pack_output_done(client.cwd)])
+
     def _send_reliable(self, client_id, data):
         client = self.clients.get(client_id)
         if not client:
             return False
-        addr = client.addr
-        max_retries = 5
-
         chunks = [data[i:i + MAX_DATA_SIZE] for i in range(0, len(data), MAX_DATA_SIZE)]
         chunks.append(pack_output_done(client.cwd))
-
-        for chunk in chunks:
-            seq = client.send_seq
-            ack_event = threading.Event()
-            with self.ack_lock:
-                self.ack_events[(client_id, seq)] = ack_event
-
-            retry_count = 0
-            success = False
-            while retry_count < max_retries and self.running:
-                try:
-                    msg = pack_msg(TYPE_OUTPUT, seq, client_id, chunk)
-                    self.sock.sendto(msg, addr)
-                    if ack_event.wait(timeout=2):
-                        success = True
-                        break
-                    retry_count += 1
-                    print(f"Retry {retry_count}/{max_retries} for client {client_id} seq {seq}")
-                except Exception as e:
-                    print(f"Send error: {e}")
-                    retry_count += 1
-
-            with self.ack_lock:
-                self.ack_events.pop((client_id, seq), None)
-
-            if not success:
-                print(f"Failed to send to client {client_id} after {max_retries} retries")
-                return False
-
-            client.send_seq = next_data_seq(client.send_seq)
-
-        return True
+        return self._send_output_chunks_reliable(client_id, chunks)
 
     def _handle_command(self, client_id, seq, payload, addr):
         client = self.clients[client_id]
@@ -251,16 +312,37 @@ class UDPServer:
         if client_id in self.clients:
             self._send_reliable(client_id, output.encode('utf-8'))
 
-    def _decode_output(self, data):
-        if not data:
-            return ''
-        return data.decode(self.encoding, errors='replace')
+    def _stream_pipe(self, client_id, pipe):
+        try:
+            decoder = codecs.getincrementaldecoder(self.encoding)(errors='replace')
+            read_chunk = pipe.read1 if hasattr(pipe, 'read1') else pipe.read
+            while self.running:
+                chunk = read_chunk(4096)
+                if not chunk:
+                    break
+                text = decoder.decode(chunk)
+                if text and not self._send_output_reliable(client_id, text.encode('utf-8')):
+                    break
+            tail = decoder.decode(b'', final=True)
+            if tail:
+                self._send_output_reliable(client_id, tail.encode('utf-8'))
+        except Exception as e:
+            if self.running:
+                print(f"Stream error: {e}")
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
 
     def _execute_and_respond(self, client_id, cmd):
         client = self.clients.get(client_id)
         if not client:
             return
 
+        proc = None
+        reader_threads = []
+        timed_out = False
         try:
             if os.name == 'nt':
                 proc = subprocess.Popen(
@@ -282,22 +364,37 @@ class UDPServer:
             with client.process_lock:
                 client.current_process = proc
 
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is None:
+                    continue
+                thread = threading.Thread(target=self._stream_pipe, args=(client_id, pipe), daemon=True)
+                thread.start()
+                reader_threads.append(thread)
+
             try:
-                stdout, stderr = proc.communicate(timeout=30)
-                output = self._decode_output(stdout) + self._decode_output(stderr)
+                proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
+                timed_out = True
                 self._kill_process_tree(proc)
-                stdout, stderr = proc.communicate()
-                output = self._decode_output(stdout) + self._decode_output(stderr) + "Error: Command execution timed out\n"
-            finally:
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+            for thread in reader_threads:
+                thread.join()
+
+            if timed_out:
+                self._send_output_reliable(client_id, b"Error: Command execution timed out\n")
+        except Exception as e:
+            self._send_output_reliable(client_id, f"Error: {str(e)}\n".encode('utf-8'))
+        finally:
+            if proc is not None:
                 with client.process_lock:
                     if client.current_process == proc:
                         client.current_process = None
-        except Exception as e:
-            output = f"Error: {str(e)}\n"
-
-        if client_id in self.clients:
-            self._send_reliable(client_id, output.encode('utf-8'))
+            if client_id in self.clients:
+                self._send_output_done(client_id)
 
     def _cleanup_loop(self):
         while self.running:

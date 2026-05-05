@@ -10,6 +10,7 @@ from common import *
 
 TEST_PORT = 19888
 results = []
+recv_expected = {}
 
 
 def log_test(name, passed, detail=""):
@@ -17,16 +18,31 @@ def log_test(name, passed, detail=""):
     msg = f"[{status}] {name}"
     if detail and not passed:
         msg += f" - {detail}"
-    print(msg, flush=True)
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or 'utf-8'
+        print(msg.encode(encoding, errors='backslashreplace').decode(encoding), flush=True)
     results.append((name, passed, detail))
 
 
 def recv_response(sock, cid, addr, timeout=5):
     got_ack = False
     all_data = b''
+    expected = recv_expected.get(cid, 0)
+    buffered = {}
+    done = False
+
+    def process_payload(payload):
+        nonlocal all_data, done
+        if unpack_output_done(payload) is not None:
+            done = True
+        else:
+            all_data += payload
+
     sock.settimeout(timeout)
     try:
-        while True:
+        while not done:
             resp_data, _ = sock.recvfrom(65535)
             resp = unpack_msg(resp_data)
             if resp is None:
@@ -34,15 +50,70 @@ def recv_response(sock, cid, addr, timeout=5):
             if resp[0] == TYPE_ACK:
                 got_ack = True
             elif resp[0] == TYPE_OUTPUT:
-                ack = pack_msg(TYPE_ACK, resp[1], cid, b'')
+                seq = resp[1]
+                payload = resp[3]
+                ack = pack_msg(TYPE_ACK, seq, cid, b'')
                 sock.sendto(ack, addr)
-                if unpack_output_done(resp[3]) is not None:
-                    break
-                all_data += resp[3]
+                if seq == expected:
+                    process_payload(payload)
+                    expected = next_data_seq(expected)
+                    while expected in buffered and not done:
+                        process_payload(buffered.pop(expected))
+                        expected = next_data_seq(expected)
+                elif is_sequence_ahead(seq, expected):
+                    buffered.setdefault(seq, payload)
                 sock.settimeout(1)
     except socket.timeout:
         pass
+    recv_expected[cid] = expected
     return got_ack, all_data
+
+
+def recv_realtime_response(sock, cid, addr, timeout=5):
+    got_ack = False
+    all_data = b''
+    first_output_at = None
+    expected = recv_expected.get(cid, 0)
+    buffered = {}
+    done = False
+    started = time.monotonic()
+
+    def process_payload(payload):
+        nonlocal all_data, first_output_at, done
+        if unpack_output_done(payload) is not None:
+            done = True
+        else:
+            if first_output_at is None and payload:
+                first_output_at = time.monotonic() - started
+            all_data += payload
+
+    sock.settimeout(timeout)
+    try:
+        while not done:
+            resp_data, _ = sock.recvfrom(65535)
+            resp = unpack_msg(resp_data)
+            if resp is None:
+                continue
+            if resp[0] == TYPE_ACK:
+                got_ack = True
+            elif resp[0] == TYPE_OUTPUT:
+                seq = resp[1]
+                payload = resp[3]
+                ack = pack_msg(TYPE_ACK, seq, cid, b'')
+                sock.sendto(ack, addr)
+                if seq == expected:
+                    process_payload(payload)
+                    expected = next_data_seq(expected)
+                    while expected in buffered and not done:
+                        process_payload(buffered.pop(expected))
+                        expected = next_data_seq(expected)
+                elif is_sequence_ahead(seq, expected):
+                    buffered.setdefault(seq, payload)
+                sock.settimeout(1)
+    except socket.timeout:
+        pass
+    recv_expected[cid] = expected
+    return got_ack, all_data, first_output_at, time.monotonic() - started
 
 
 print("=" * 60, flush=True)
@@ -87,6 +158,11 @@ try:
     log_test("Invalid type pack rejected", False)
 except ValueError:
     log_test("Invalid type pack rejected", True)
+
+print("\n[1b] Advanced Protocol Helpers", flush=True)
+log_test("ANSI escape stripped", strip_ansi_sequences(b'\x1b[31mRED\x1b[0m') == b'RED')
+log_test("Tab preserved", normalize_command_input('echo\tTAB_OK\n') == 'echo\tTAB_OK\n')
+log_test("ANSI input normalized", normalize_command_input('echo \x1b[31mANSI_OK\x1b[0m\n') == 'echo ANSI_OK\n')
 
 # ===== Start server =====
 print("\n[2] Starting UDP server...", flush=True)
@@ -141,6 +217,45 @@ output_str = output.decode('utf-8', errors='replace')
 log_test("Command ACK received", got_ack)
 log_test("Echo output correct", "TEST_OK_123" in output_str, f"out={output_str[:80]}")
 sock_cmd.close()
+
+cid_encoding = 10015
+sock_encoding = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+encoding_cmd = 'echo ENCODING_OK_编码' if os.name == 'nt' else 'printf "ENCODING_OK_编码\n"'
+sock_encoding.sendto(pack_msg(TYPE_COMMAND, 0, cid_encoding, encoding_cmd.encode('utf-8')), addr)
+_, encoding_out = recv_response(sock_encoding, cid_encoding, addr, timeout=5)
+encoding_str = encoding_out.decode('utf-8', errors='replace')
+log_test("Non-ASCII output decoded", "ENCODING_OK_编码" in encoding_str, f"out={encoding_str[:80]}")
+sock_encoding.close()
+time.sleep(0.3)
+
+print("\n[3b] Advanced Output", flush=True)
+if os.name == 'nt':
+    rt_cmd = 'ping -n 3 127.0.0.1'
+    large_cmd = 'for /L %i in (1,1,1000) do @echo XXXXXXXXXX'
+else:
+    rt_cmd = 'python -c "import time; print(\'RT1\', flush=True); time.sleep(1.5); print(\'RT2\', flush=True)"'
+    large_cmd = 'python -c "print(\'X\' * 8000)"'
+
+cid_rt = 10013
+sock_rt = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock_rt.sendto(pack_msg(TYPE_COMMAND, 0, cid_rt, rt_cmd.encode('utf-8')), addr)
+got_rt_ack, rt_out, first_rt_at, total_rt_time = recv_realtime_response(sock_rt, cid_rt, addr, timeout=8)
+rt_str = rt_out.decode('utf-8', errors='replace')
+log_test("Real-time output ACK received", got_rt_ack)
+if os.name == 'nt':
+    log_test("Real-time output complete", len(rt_out) > 0, f"out={rt_str[:120]}")
+else:
+    log_test("Real-time output complete", "RT1" in rt_str and "RT2" in rt_str, f"out={rt_str[:120]}")
+log_test("First output before command exit", first_rt_at is not None and first_rt_at < total_rt_time - 0.5,
+         f"first={first_rt_at}, total={total_rt_time}")
+sock_rt.close()
+
+cid_large = 10014
+sock_large = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock_large.sendto(pack_msg(TYPE_COMMAND, 0, cid_large, large_cmd.encode('utf-8')), addr)
+_, large_out = recv_response(sock_large, cid_large, addr, timeout=8)
+log_test("Large output over window complete", large_out.count(b'X') >= 8000, f"len={len(large_out)}")
+sock_large.close()
 time.sleep(0.3)
 
 # ===== Test 4: Multiple Clients =====
@@ -222,6 +337,14 @@ _, out_ctrl2 = recv_response(sock_ctrl2, cid_ctrl2, addr, timeout=5)
 ctrl2_str = out_ctrl2.decode('utf-8', errors='replace')
 log_test("Carriage return handled", "CR_OK" in ctrl2_str, f"out={ctrl2_str[:80]}")
 sock_ctrl2.close()
+
+cid_ctrl3 = 10012
+sock_ctrl3 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock_ctrl3.sendto(pack_msg(TYPE_COMMAND, 0, cid_ctrl3, b'echo\tTAB_OK\n'), addr)
+_, out_ctrl3 = recv_response(sock_ctrl3, cid_ctrl3, addr, timeout=5)
+ctrl3_str = out_ctrl3.decode('utf-8', errors='replace')
+log_test("Tab passed to shell", "TAB_OK" in ctrl3_str, f"out={ctrl3_str[:80]}")
+sock_ctrl3.close()
 time.sleep(0.3)
 
 # ===== Test 8: Error Handling =====
@@ -288,7 +411,7 @@ except Exception:
 print("\n" + "=" * 60, flush=True)
 print("  TEST SUMMARY", flush=True)
 print("=" * 60, flush=True)
-passed = sum(1 for _, p, _ in results)
+passed = sum(1 for _, p, _ in results if p)
 total = len(results)
 print(f"Passed: {passed}/{total}", flush=True)
 
@@ -297,7 +420,11 @@ for name, p, detail in results:
     line = f"  [{s}] {name}"
     if detail and not p:
         line += f" ({detail})"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or 'utf-8'
+        print(line.encode(encoding, errors='backslashreplace').decode(encoding), flush=True)
 
 if passed == total:
     print("\nAll tests passed!", flush=True)

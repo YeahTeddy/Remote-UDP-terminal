@@ -1,3 +1,4 @@
+import re
 import struct
 
 MAGIC = 0x5554
@@ -14,15 +15,31 @@ MAX_DATA_SIZE = 1472 - HEADER_SIZE
 MAX_SEQUENCE = 0xFFFFFFFF
 DATA_SEQUENCE_MOD = MAX_SEQUENCE
 HEARTBEAT_SEQ = MAX_SEQUENCE
+OUTPUT_WINDOW_SIZE = 8
+ACK_TIMEOUT = 0.5
+MAX_RETRIES = 5
 OUTPUT_DONE_PREFIX = b'\x00CWD:'
 PROMPT_INFO_PREFIX = b'\x00PROMPT:'
+ANSI_ESCAPE_RE = re.compile(
+    rb'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))'
+)
 
 
 def next_data_seq(seq: int) -> int:
     return (seq + 1) % DATA_SEQUENCE_MOD
 
 
+def is_sequence_ahead(seq: int, expected: int) -> bool:
+    distance = (seq - expected) % DATA_SEQUENCE_MOD
+    return 0 < distance < DATA_SEQUENCE_MOD // 2
+
+
+def strip_ansi_sequences(data: bytes) -> bytes:
+    return ANSI_ESCAPE_RE.sub(b'', data)
+
+
 def normalize_command_input(text: str) -> str:
+    text = strip_ansi_sequences(text.encode('utf-8', errors='replace')).decode('utf-8', errors='replace')
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     result = []
     for ch in text:

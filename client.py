@@ -17,6 +17,7 @@ class UDPClient:
         self.running = False
         self.send_seq = 0
         self.recv_expected_seq = 0
+        self.recv_buffer = {}
         self.ack_event = threading.Event()
         self.output_done_event = threading.Event()
         self.heartbeat_ack_event = threading.Event()
@@ -247,6 +248,29 @@ class UDPClient:
             self.prompt_dir = self._format_prompt_dir(cwd)
         self.prompt_ready_event.set()
 
+    def _process_output_payload(self, payload):
+        done_cwd = unpack_output_done(payload)
+        if done_cwd is not None:
+            if done_cwd:
+                self.prompt_dir = self._format_prompt_dir(done_cwd)
+            self.output_done_event.set()
+            return
+
+        with self.print_lock:
+            sys.stdout.write(strip_ansi_sequences(payload).decode('utf-8', errors='replace'))
+            sys.stdout.flush()
+
+    def _handle_output_packet(self, seq, payload):
+        if seq == self.recv_expected_seq:
+            self._process_output_payload(payload)
+            self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
+            while self.recv_expected_seq in self.recv_buffer:
+                buffered_payload = self.recv_buffer.pop(self.recv_expected_seq)
+                self._process_output_payload(buffered_payload)
+                self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
+        elif is_sequence_ahead(seq, self.recv_expected_seq):
+            self.recv_buffer.setdefault(seq, payload)
+
     def _recv_loop(self):
         while self.running:
             try:
@@ -266,19 +290,9 @@ class UDPClient:
                     if seq == self.waiting_seq:
                         self.ack_event.set()
                 elif msg_type == TYPE_OUTPUT:
-                    if seq == self.recv_expected_seq:
-                        done_cwd = unpack_output_done(payload)
-                        if done_cwd is not None:
-                            if done_cwd:
-                                self.prompt_dir = self._format_prompt_dir(done_cwd)
-                            self.output_done_event.set()
-                        else:
-                            with self.print_lock:
-                                sys.stdout.write(payload.decode('utf-8', errors='replace'))
-                                sys.stdout.flush()
-                        self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
                     ack_msg = pack_msg(TYPE_ACK, seq, self.client_id, b'')
                     self.sock.sendto(ack_msg, self.server_addr)
+                    self._handle_output_packet(seq, payload)
             except socket.timeout:
                 continue
             except (ConnectionResetError, OSError):
