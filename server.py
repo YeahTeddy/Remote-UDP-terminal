@@ -150,6 +150,7 @@ class UDPServer:
         self.encoding = locale.getpreferredencoding(False) or 'utf-8'
         self.server_user = getpass.getuser()
         self.server_host = platform.node() or socket.gethostname()
+        self.server_session_id = os.urandom(8).hex()
         print(f"UDP Server started on {host}:{port}")
 
     def start(self):
@@ -211,7 +212,7 @@ class UDPServer:
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         print(f"[{timestamp}] Heartbeat received from client {client_id} at {addr}")
         client = self.clients[client_id]
-        payload = pack_prompt_info(self.server_user, self.server_host, client.cwd)
+        payload = pack_prompt_info(self.server_user, self.server_host, client.cwd, self.server_session_id)
         ack_msg = pack_msg(TYPE_ACK, seq, client_id, payload)
         self.sock.sendto(ack_msg, addr)
 

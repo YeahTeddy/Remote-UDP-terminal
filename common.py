@@ -111,17 +111,19 @@ def unpack_output_done(data: bytes) -> str | None:
     return None
 
 
-def pack_prompt_info(user: str, host: str, cwd: str) -> bytes:
-    return PROMPT_INFO_PREFIX + '\0'.join((user, host, cwd)).encode('utf-8')
+def pack_prompt_info(user: str, host: str, cwd: str, server_session_id: str = '') -> bytes:
+    return PROMPT_INFO_PREFIX + '\0'.join((user, host, cwd, server_session_id)).encode('utf-8')
 
 
-def unpack_prompt_info(data: bytes) -> tuple[str, str, str] | None:
+def unpack_prompt_info(data: bytes) -> tuple[str, str, str, str] | None:
     if not data.startswith(PROMPT_INFO_PREFIX):
         return None
-    parts = data[len(PROMPT_INFO_PREFIX):].decode('utf-8', errors='replace').split('\0', 2)
-    if len(parts) != 3:
+    parts = data[len(PROMPT_INFO_PREFIX):].decode('utf-8', errors='replace').split('\0', 3)
+    if len(parts) == 3:
+        parts.append('')
+    if len(parts) != 4:
         return None
-    return (parts[0], parts[1], parts[2])
+    return (parts[0], parts[1], parts[2], parts[3])
 
 
 def pack_window_update(available_packets: int, available_bytes: int) -> bytes:
