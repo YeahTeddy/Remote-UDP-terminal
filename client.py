@@ -4,7 +4,17 @@ import time
 import random
 import signal
 import sys
+import os
+import shutil
 import _thread
+
+if os.name == 'nt':
+    import msvcrt
+else:
+    import select
+    import termios
+    import tty
+
 from common import *
 
 
@@ -18,11 +28,17 @@ class UDPClient:
         self.send_seq = 0
         self.recv_expected_seq = 0
         self.recv_buffer = {}
+        self.recv_buffer_bytes = 0
+        self.recv_buffer_limit_packets = RECV_BUFFER_LIMIT_PACKETS
+        self.recv_buffer_limit_bytes = RECV_BUFFER_LIMIT_BYTES
         self.ack_event = threading.Event()
         self.output_done_event = threading.Event()
         self.heartbeat_ack_event = threading.Event()
         self.last_heartbeat_ack = 0
         self.waiting_seq = -1
+        self.stdin_seq = DATA_SEQUENCE_MOD // 3
+        self.window_update_seq = DATA_SEQUENCE_MOD // 2
+        self.resize_seq = DATA_SEQUENCE_MOD * 2 // 3
         self.print_lock = threading.Lock()
         self.prompt_ready_event = threading.Event()
         self.prompt_user = 'user'
@@ -31,9 +47,15 @@ class UDPClient:
         self.prompt_interrupt_seen = False
         self.suppress_interrupt_until = 0
         self.saved_sigint_handler = None
+        self.saved_sigwinch_handler = None
         self.resume_sigint_at = 0
         self.connection_error_reported = False
         self.connected = False
+        self.interactive_mode = False
+        self.raw_terminal_attrs = None
+        self.pending_windows_high_surrogate = None
+        self.last_rows = 24
+        self.last_cols = 80
         print(f"Client ID: {self.client_id}, connecting to {server_host}:{server_port}")
 
     def _format_prompt_dir(self, path):
@@ -128,6 +150,8 @@ class UDPClient:
             return
 
         self.connected = True
+        self._install_resize_handler()
+        self._send_resize()
         heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         heartbeat_thread.start()
         print("Connected to server, enter commands to execute, 'exit' to quit")
@@ -155,23 +179,40 @@ class UDPClient:
                 if not cmd.strip():
                     continue
 
+                is_pty = should_use_pty_command(cmd)
                 self.output_done_event.clear()
                 self._begin_command_interrupt_window()
+                if is_pty:
+                    self._send_resize()
+                    self.interactive_mode = True
                 sent = self._send_command_reliable((cmd + '\n').encode('utf-8'))
-                if sent:
-                    while self.running and not self.output_done_event.is_set():
-                        try:
-                            self.output_done_event.wait(0.1)
-                        except KeyboardInterrupt:
-                            if not self.running:
-                                break
-                            if self._is_suppressed_interrupt():
-                                continue
-                            self._print_interrupt_marker()
-                            self._send_interrupt()
+                if not sent:
+                    self.interactive_mode = False
+                    self._restore_terminal_mode()
+                    continue
+                if is_pty:
+                    self._run_interactive_until_done()
+                else:
+                    self._wait_for_command_output()
         except KeyboardInterrupt:
             if self.running:
                 self._handle_prompt_interrupt()
+        finally:
+            self._restore_terminal_mode()
+            self._restore_resize_handler()
+
+    def _wait_for_command_output(self):
+        while self.running and not self.output_done_event.is_set():
+            try:
+                self.output_done_event.wait(0.1)
+            except KeyboardInterrupt:
+                if not self.running:
+                    break
+                if self._is_suppressed_interrupt():
+                    continue
+                if os.name != 'nt':
+                    self._print_interrupt_marker()
+                self._send_interrupt()
 
     def _close_socket(self):
         try:
@@ -183,6 +224,8 @@ class UDPClient:
         if not self.running:
             return
         self._resume_sigint()
+        self._restore_terminal_mode()
+        self._restore_resize_handler()
         self.running = False
         self.connected = False
         self._close_socket()
@@ -228,6 +271,7 @@ class UDPClient:
         self.connection_error_reported = True
         self.running = False
         self.connected = False
+        self._restore_terminal_mode()
         self._safe_print("\nConnection error: server did not respond to heartbeat, exiting")
         self._close_socket()
         _thread.interrupt_main()
@@ -248,6 +292,23 @@ class UDPClient:
             self.prompt_dir = self._format_prompt_dir(cwd)
         self.prompt_ready_event.set()
 
+    def _available_recv_window_packets(self):
+        return max(0, self.recv_buffer_limit_packets - len(self.recv_buffer))
+
+    def _available_recv_window_bytes(self):
+        return max(0, self.recv_buffer_limit_bytes - self.recv_buffer_bytes)
+
+    def _make_window_update_payload(self):
+        return pack_window_update(self._available_recv_window_packets(), self._available_recv_window_bytes())
+
+    def _send_window_update(self):
+        try:
+            msg = pack_msg(TYPE_WINDOW_UPDATE, self.window_update_seq, self.client_id, self._make_window_update_payload())
+            self.sock.sendto(msg, self.server_addr)
+            self.window_update_seq = next_data_seq(self.window_update_seq)
+        except Exception:
+            pass
+
     def _process_output_payload(self, payload):
         done_cwd = unpack_output_done(payload)
         if done_cwd is not None:
@@ -257,8 +318,17 @@ class UDPClient:
             return
 
         with self.print_lock:
-            sys.stdout.write(strip_ansi_sequences(payload).decode('utf-8', errors='replace'))
-            sys.stdout.flush()
+            if self.interactive_mode:
+                out = getattr(sys.stdout, 'buffer', None)
+                if out is not None:
+                    out.write(payload)
+                    out.flush()
+                else:
+                    sys.stdout.write(payload.decode('utf-8', errors='replace'))
+                    sys.stdout.flush()
+            else:
+                sys.stdout.write(strip_ansi_sequences(payload).decode('utf-8', errors='replace'))
+                sys.stdout.flush()
 
     def _handle_output_packet(self, seq, payload):
         if seq == self.recv_expected_seq:
@@ -266,10 +336,21 @@ class UDPClient:
             self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
             while self.recv_expected_seq in self.recv_buffer:
                 buffered_payload = self.recv_buffer.pop(self.recv_expected_seq)
+                self.recv_buffer_bytes -= len(buffered_payload)
                 self._process_output_payload(buffered_payload)
                 self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
-        elif is_sequence_ahead(seq, self.recv_expected_seq):
-            self.recv_buffer.setdefault(seq, payload)
+            return True
+        if is_sequence_ahead(seq, self.recv_expected_seq):
+            if seq in self.recv_buffer:
+                return True
+            if len(self.recv_buffer) >= self.recv_buffer_limit_packets:
+                return False
+            if self.recv_buffer_bytes + len(payload) > self.recv_buffer_limit_bytes:
+                return False
+            self.recv_buffer[seq] = payload
+            self.recv_buffer_bytes += len(payload)
+            return True
+        return True
 
     def _recv_loop(self):
         while self.running:
@@ -290,9 +371,12 @@ class UDPClient:
                     if seq == self.waiting_seq:
                         self.ack_event.set()
                 elif msg_type == TYPE_OUTPUT:
-                    ack_msg = pack_msg(TYPE_ACK, seq, self.client_id, b'')
-                    self.sock.sendto(ack_msg, self.server_addr)
-                    self._handle_output_packet(seq, payload)
+                    accepted = self._handle_output_packet(seq, payload)
+                    if accepted:
+                        ack_msg = pack_msg(TYPE_ACK, seq, self.client_id, self._make_window_update_payload())
+                        self.sock.sendto(ack_msg, self.server_addr)
+                    else:
+                        self._send_window_update()
             except socket.timeout:
                 continue
             except (ConnectionResetError, OSError):
@@ -328,6 +412,159 @@ class UDPClient:
         with self.print_lock:
             print("\nSend failed after retries: server may be unreachable or network interrupted")
         return False
+
+    def _get_terminal_size(self):
+        size = shutil.get_terminal_size(fallback=(80, 24))
+        return size.lines, size.columns
+
+    def _send_resize(self, rows=None, cols=None):
+        try:
+            if rows is None or cols is None:
+                rows, cols = self._get_terminal_size()
+            rows = max(1, min(1000, int(rows)))
+            cols = max(1, min(1000, int(cols)))
+            self.last_rows = rows
+            self.last_cols = cols
+            msg = pack_msg(TYPE_RESIZE, self.resize_seq, self.client_id, pack_resize(rows, cols))
+            self.sock.sendto(msg, self.server_addr)
+            self.resize_seq = next_data_seq(self.resize_seq)
+        except Exception:
+            pass
+
+    def _install_resize_handler(self):
+        if os.name == 'nt' or not hasattr(signal, 'SIGWINCH'):
+            return
+        try:
+            self.saved_sigwinch_handler = signal.getsignal(signal.SIGWINCH)
+
+            def handle_winch(signum, frame):
+                self._send_resize()
+
+            signal.signal(signal.SIGWINCH, handle_winch)
+        except (ValueError, AttributeError):
+            pass
+
+    def _restore_resize_handler(self):
+        if os.name == 'nt' or self.saved_sigwinch_handler is None or not hasattr(signal, 'SIGWINCH'):
+            return
+        try:
+            signal.signal(signal.SIGWINCH, self.saved_sigwinch_handler)
+        except (ValueError, AttributeError):
+            pass
+        self.saved_sigwinch_handler = None
+
+    def _poll_resize_if_changed(self):
+        rows, cols = self._get_terminal_size()
+        if rows != self.last_rows or cols != self.last_cols:
+            self._send_resize(rows, cols)
+
+    def _enter_raw_mode(self):
+        if os.name == 'nt' or not sys.stdin.isatty() or self.raw_terminal_attrs is not None:
+            return
+        try:
+            fd = sys.stdin.fileno()
+            self.raw_terminal_attrs = termios.tcgetattr(fd)
+            tty.setraw(fd)
+        except Exception:
+            self.raw_terminal_attrs = None
+
+    def _restore_terminal_mode(self):
+        if os.name == 'nt' or self.raw_terminal_attrs is None:
+            return
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.raw_terminal_attrs)
+        except Exception:
+            pass
+        self.raw_terminal_attrs = None
+
+    def _send_stdin(self, data):
+        for i in range(0, len(data), MAX_DATA_SIZE):
+            chunk = data[i:i + MAX_DATA_SIZE]
+            try:
+                msg = pack_msg(TYPE_STDIN, self.stdin_seq, self.client_id, chunk)
+                self.sock.sendto(msg, self.server_addr)
+                self.stdin_seq = next_data_seq(self.stdin_seq)
+            except Exception:
+                return False
+        return True
+
+    def _windows_special_key_to_bytes(self, code):
+        mapping = {
+            'H': b'\x1b[A',
+            'P': b'\x1b[B',
+            'M': b'\x1b[C',
+            'K': b'\x1b[D',
+            'G': b'\x1b[H',
+            'O': b'\x1b[F',
+            'S': b'\x1b[3~',
+            'I': b'\x1b[5~',
+            'Q': b'\x1b[6~',
+        }
+        return mapping.get(code, b'')
+
+    def _windows_char_to_input_bytes(self, ch):
+        if ch == '\r':
+            return b'\r'
+        if ch == '\b':
+            return b'\x7f'
+
+        codepoint = ord(ch)
+        pending = self.pending_windows_high_surrogate
+        if pending is not None:
+            self.pending_windows_high_surrogate = None
+            high = ord(pending)
+            if 0xDC00 <= codepoint <= 0xDFFF:
+                combined = 0x10000 + ((high - 0xD800) << 10) + (codepoint - 0xDC00)
+                return chr(combined).encode('utf-8')
+
+        if 0xD800 <= codepoint <= 0xDBFF:
+            self.pending_windows_high_surrogate = ch
+            return b''
+        if 0xDC00 <= codepoint <= 0xDFFF:
+            return b''
+        return ch.encode('utf-8', errors='ignore')
+
+    def _read_windows_key(self):
+        if not msvcrt.kbhit():
+            return None
+        chunks = []
+        while msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ('\x00', '\xe0'):
+                code = msvcrt.getwch()
+                data = self._windows_special_key_to_bytes(code)
+            else:
+                data = self._windows_char_to_input_bytes(ch)
+            if data:
+                chunks.append(data)
+        return b''.join(chunks)
+
+    def _run_interactive_until_done(self):
+        self.interactive_mode = True
+        self._enter_raw_mode()
+        try:
+            while self.running and not self.output_done_event.is_set():
+                self._poll_resize_if_changed()
+                try:
+                    if os.name == 'nt':
+                        data = self._read_windows_key()
+                        if data:
+                            self._send_stdin(data)
+                        else:
+                            self.output_done_event.wait(0.005)
+                    elif sys.stdin.isatty():
+                        readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+                        if readable:
+                            data = os.read(sys.stdin.fileno(), 1024)
+                            if data:
+                                self._send_stdin(data)
+                    else:
+                        self.output_done_event.wait(0.05)
+                except KeyboardInterrupt:
+                    self._send_stdin(b'\x03')
+        finally:
+            self._restore_terminal_mode()
+            self.interactive_mode = False
 
 
 if __name__ == '__main__':

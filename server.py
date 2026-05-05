@@ -1,4 +1,6 @@
 import codecs
+import importlib
+import select
 import socket
 import threading
 import time
@@ -9,7 +11,106 @@ import locale
 import shlex
 import getpass
 import platform
+
+if os.name != 'nt':
+    import fcntl
+    import pty
+    import struct as winsize_struct
+    import termios
+else:
+    fcntl = None
+    pty = None
+    winsize_struct = None
+    termios = None
+
 from common import *
+
+
+class WindowsPtySession:
+    def __init__(self, cmd, cwd, rows, cols):
+        try:
+            PtyProcess = importlib.import_module('winpty').PtyProcess
+        except ImportError as exc:
+            raise RuntimeError("Windows PTY requires pywinpty; install it with: pip install pywinpty") from exc
+
+        last_error = None
+        for kwargs in (
+            {'cwd': cwd, 'dimensions': (rows, cols)},
+            {'cwd': cwd},
+            {'dimensions': (rows, cols)},
+            {},
+        ):
+            try:
+                self.proc = PtyProcess.spawn(cmd, **kwargs)
+                break
+            except TypeError as exc:
+                last_error = exc
+        else:
+            raise last_error
+        self.stdin_decoder = codecs.getincrementaldecoder('utf-8')(errors='ignore')
+        self.resize(rows, cols)
+
+    def read(self, max_bytes=4096, timeout=0.005):
+        fileobj = getattr(self.proc, 'fileobj', None)
+        if fileobj is not None:
+            readable, _, _ = select.select([fileobj], [], [], timeout)
+            if not readable:
+                return b''
+        try:
+            data = self.proc.read(max_bytes)
+        except TypeError:
+            data = self.proc.read()
+        except Exception:
+            if not self.is_alive():
+                return b''
+            raise
+        if data is None:
+            return b''
+        if isinstance(data, bytes):
+            return data
+        return data.encode('utf-8', errors='replace')
+
+    def write(self, data):
+        text = self.stdin_decoder.decode(data)
+        if text:
+            self.proc.write(text)
+
+    def resize(self, rows, cols):
+        for name in ('setwinsize', 'set_winsize', 'resize'):
+            method = getattr(self.proc, name, None)
+            if not method:
+                continue
+            try:
+                method(rows, cols)
+                return
+            except TypeError:
+                try:
+                    method(cols, rows)
+                    return
+                except TypeError:
+                    continue
+
+    def is_alive(self):
+        for name in ('isalive', 'is_alive'):
+            method = getattr(self.proc, name, None)
+            if method:
+                return method()
+        return True
+
+    def terminate(self):
+        for call in (
+            lambda: self.proc.terminate(force=True),
+            lambda: self.proc.terminate(),
+            lambda: self.proc.kill(),
+            lambda: self.proc.close(),
+        ):
+            try:
+                call()
+                return
+            except (AttributeError, TypeError):
+                continue
+            except Exception:
+                return
 
 
 class ClientInfo:
@@ -20,8 +121,21 @@ class ClientInfo:
         self.send_seq = 0
         self.cwd = os.getcwd()
         self.current_process = None
+        self.current_command = None
         self.process_lock = threading.Lock()
         self.send_lock = threading.Lock()
+        self.advertised_window_packets = OUTPUT_WINDOW_SIZE
+        self.advertised_window_bytes = RECV_BUFFER_LIMIT_BYTES
+        self.window_lock = threading.Lock()
+        self.pty_fd = None
+        self.pty_session = None
+        self.pty_lock = threading.Lock()
+        self.is_interactive = False
+        self.stdin_recv_expected_seq = 0
+        self.pending_stdin = []
+        self.stdin_event = threading.Event()
+        self.term_rows = 24
+        self.term_cols = 80
 
 
 class UDPServer:
@@ -53,6 +167,8 @@ class UDPServer:
 
     def stop(self):
         self.running = False
+        for client in list(self.clients.values()):
+            self._cleanup_client_runtime(client)
         self.sock.close()
         print("Server stopped")
 
@@ -76,11 +192,17 @@ class UDPServer:
                 if msg_type == TYPE_HEARTBEAT:
                     self._handle_heartbeat(client_id, seq, addr)
                 elif msg_type == TYPE_ACK:
-                    self._handle_ack(client_id, seq)
+                    self._handle_ack(client_id, seq, payload)
                 elif msg_type == TYPE_COMMAND:
                     self._handle_command(client_id, seq, payload, addr)
                 elif msg_type == TYPE_INTERRUPT:
                     self._handle_interrupt(client_id)
+                elif msg_type == TYPE_WINDOW_UPDATE:
+                    self._handle_window_update(client_id, payload)
+                elif msg_type == TYPE_RESIZE:
+                    self._handle_resize(client_id, seq, payload, addr)
+                elif msg_type == TYPE_STDIN:
+                    self._handle_stdin(client_id, seq, payload, addr)
             except Exception as e:
                 if self.running:
                     print(f"Recv error: {e}")
@@ -93,11 +215,34 @@ class UDPServer:
         ack_msg = pack_msg(TYPE_ACK, seq, client_id, payload)
         self.sock.sendto(ack_msg, addr)
 
-    def _handle_ack(self, client_id, seq):
+    def _handle_ack(self, client_id, seq, payload=b''):
+        self._apply_window_update(client_id, payload)
         with self.ack_lock:
             key = (client_id, seq)
             if key in self.ack_events:
                 self.ack_events[key].set()
+
+    def _apply_window_update(self, client_id, payload_or_update):
+        if isinstance(payload_or_update, tuple):
+            update = payload_or_update
+        else:
+            update = unpack_window_update(payload_or_update)
+        if not update:
+            return
+        packets, bytes_available = update
+        client = self.clients.get(client_id)
+        if not client:
+            return
+        with client.window_lock:
+            client.advertised_window_packets = max(0, min(OUTPUT_WINDOW_SIZE, packets))
+            client.advertised_window_bytes = max(0, bytes_available)
+
+    def _handle_window_update(self, client_id, payload):
+        self._apply_window_update(client_id, payload)
+
+    def _get_effective_send_window(self, client):
+        with client.window_lock:
+            return max(0, min(OUTPUT_WINDOW_SIZE, client.advertised_window_packets))
 
     def _kill_process_tree(self, proc):
         try:
@@ -116,11 +261,11 @@ class UDPServer:
             except Exception:
                 pass
 
-    def _interrupt_process(self, proc):
+    def _interrupt_process(self, proc, cmd=None):
         try:
             if os.name == 'nt':
                 proc.send_signal(signal.CTRL_BREAK_EVENT)
-                time.sleep(0.2)
+                time.sleep(0.05 if self._is_ping_command(cmd) else 0.2)
                 if proc.poll() is None:
                     self._kill_process_tree(proc)
             else:
@@ -128,16 +273,96 @@ class UDPServer:
         except Exception:
             self._kill_process_tree(proc)
 
+    def _write_pty(self, client, payload):
+        try:
+            with client.pty_lock:
+                if client.pty_session is not None:
+                    client.pty_session.write(payload)
+                    return True
+                if client.pty_fd is not None:
+                    os.write(client.pty_fd, payload)
+                    return True
+        except Exception:
+            return False
+        return False
+
     def _handle_interrupt(self, client_id):
         client = self.clients.get(client_id)
         if not client:
             return
 
+        if client.is_interactive and self._write_pty(client, b'\x03'):
+            return
+
         with client.process_lock:
             proc = client.current_process
+            cmd = client.current_command
 
         if proc and proc.poll() is None:
-            self._interrupt_process(proc)
+            self._interrupt_process(proc, cmd)
+
+    def _handle_stdin(self, client_id, seq, payload, addr):
+        client = self.clients.get(client_id)
+        if not client:
+            return
+
+        ack_msg = pack_msg(TYPE_ACK, seq, client_id, b'')
+        self.sock.sendto(ack_msg, addr)
+
+        expected = client.stdin_recv_expected_seq
+        if seq == expected:
+            client.stdin_recv_expected_seq = next_data_seq(expected)
+        elif is_sequence_ahead(seq, expected):
+            client.stdin_recv_expected_seq = next_data_seq(seq)
+        else:
+            return
+
+        with client.pty_lock:
+            if client.is_interactive and len(client.pending_stdin) < 128:
+                client.pending_stdin.append(payload)
+                client.stdin_event.set()
+
+    def _flush_pending_stdin(self, client):
+        with client.pty_lock:
+            pending = client.pending_stdin
+            client.pending_stdin = []
+            client.stdin_event.clear()
+        if pending:
+            self._write_pty(client, b''.join(pending))
+
+    def _set_pty_size_fd(self, fd, rows, cols):
+        if os.name == 'nt' or fd is None:
+            return
+        try:
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize_struct.pack('HHHH', rows, cols, 0, 0))
+        except Exception:
+            pass
+
+    def _resize_client_pty(self, client, rows, cols):
+        with client.pty_lock:
+            session = client.pty_session
+            fd = client.pty_fd
+        if session is not None:
+            try:
+                session.resize(rows, cols)
+            except Exception:
+                pass
+        elif fd is not None:
+            self._set_pty_size_fd(fd, rows, cols)
+
+    def _handle_resize(self, client_id, seq, payload, addr):
+        client = self.clients.get(client_id)
+        if not client:
+            return
+        size = unpack_resize(payload)
+        if not size:
+            return
+        rows, cols = size
+        client.term_rows = rows
+        client.term_cols = cols
+        self._resize_client_pty(client, rows, cols)
+        ack_msg = pack_msg(TYPE_ACK, seq, client_id, b'')
+        self.sock.sendto(ack_msg, addr)
 
     def _send_packet(self, client_id, addr, seq, chunk):
         msg = pack_msg(TYPE_OUTPUT, seq, client_id, chunk)
@@ -172,46 +397,56 @@ class UDPServer:
 
             base = 0
             next_to_send = 0
+            last_progress = time.monotonic()
             try:
                 while base < len(packets) and self.running:
-                    while next_to_send < len(packets) and next_to_send - base < OUTPUT_WINDOW_SIZE:
-                        packet = packets[next_to_send]
-                        self._send_packet(client_id, addr, packet['seq'], packet['chunk'])
-                        packet['sent'] = True
-                        packet['last_sent'] = time.monotonic()
-                        next_to_send += 1
-
                     for packet in packets[base:next_to_send]:
                         if not packet['acked'] and packet['event'].is_set():
                             packet['acked'] = True
+                            last_progress = time.monotonic()
 
                     while base < len(packets) and packets[base]['acked']:
                         with self.ack_lock:
                             self.ack_events.pop((client_id, packets[base]['seq']), None)
                         base += 1
+                        last_progress = time.monotonic()
 
                     if base >= len(packets):
                         return True
+
+                    effective_window = self._get_effective_send_window(client)
+                    while next_to_send < len(packets) and next_to_send - base < effective_window:
+                        packet = packets[next_to_send]
+                        self._send_packet(client_id, addr, packet['seq'], packet['chunk'])
+                        packet['sent'] = True
+                        packet['last_sent'] = time.monotonic()
+                        next_to_send += 1
+                        last_progress = time.monotonic()
 
                     now = time.monotonic()
                     timed_out = any(
                         not packet['acked'] and packet['sent'] and now - packet['last_sent'] >= ACK_TIMEOUT
                         for packet in packets[base:next_to_send]
                     )
-                    if not timed_out:
-                        time.sleep(0.01)
+                    if timed_out:
+                        for packet in packets[base:next_to_send]:
+                            if packet['acked']:
+                                continue
+                            if packet['retries'] >= MAX_RETRIES:
+                                print(f"Failed to send to client {client_id} after {MAX_RETRIES} retries")
+                                return False
+                            packet['retries'] += 1
+                            self._send_packet(client_id, addr, packet['seq'], packet['chunk'])
+                            packet['last_sent'] = time.monotonic()
+                            last_progress = time.monotonic()
+                            print(f"Retry {packet['retries']}/{MAX_RETRIES} for client {client_id} seq {packet['seq']}")
                         continue
 
-                    for packet in packets[base:next_to_send]:
-                        if packet['acked']:
-                            continue
-                        if packet['retries'] >= MAX_RETRIES:
-                            print(f"Failed to send to client {client_id} after {MAX_RETRIES} retries")
+                    if next_to_send == base and effective_window <= 0:
+                        if now - last_progress >= FLOW_CONTROL_IDLE_TIMEOUT:
+                            print(f"Flow control timeout for client {client_id}")
                             return False
-                        packet['retries'] += 1
-                        self._send_packet(client_id, addr, packet['seq'], packet['chunk'])
-                        packet['last_sent'] = time.monotonic()
-                        print(f"Retry {packet['retries']}/{MAX_RETRIES} for client {client_id} seq {packet['seq']}")
+                    time.sleep(0.001)
             except Exception as e:
                 print(f"Send error: {e}")
                 return False
@@ -233,11 +468,8 @@ class UDPServer:
         return self._send_output_chunks_reliable(client_id, [pack_output_done(client.cwd)])
 
     def _send_reliable(self, client_id, data):
-        client = self.clients.get(client_id)
-        if not client:
-            return False
         chunks = [data[i:i + MAX_DATA_SIZE] for i in range(0, len(data), MAX_DATA_SIZE)]
-        chunks.append(pack_output_done(client.cwd))
+        chunks.append(pack_output_done(self.clients[client_id].cwd))
         return self._send_output_chunks_reliable(client_id, chunks)
 
     def _handle_command(self, client_id, seq, payload, addr):
@@ -265,11 +497,15 @@ class UDPServer:
             ).start()
             return
 
-        threading.Thread(
-            target=self._execute_and_respond,
-            args=(client_id, cmd),
-            daemon=True
-        ).start()
+        if should_use_pty_command(cmd):
+            with client.pty_lock:
+                client.is_interactive = True
+                client.pending_stdin = []
+                client.stdin_event.clear()
+            target = self._execute_pty_and_respond
+        else:
+            target = self._execute_and_respond
+        threading.Thread(target=target, args=(client_id, cmd), daemon=True).start()
 
     def _split_command(self, cmd):
         try:
@@ -280,6 +516,15 @@ class UDPServer:
     def _is_cd_command(self, cmd):
         tokens = self._split_command(cmd)
         return bool(tokens) and tokens[0].lower() == 'cd' and not any(token in {'&', '&&', '|', '||', ';'} for token in tokens)
+
+    def _is_ping_command(self, cmd):
+        tokens = self._split_command(cmd or '')
+        if not tokens:
+            return False
+        exe = os.path.basename(tokens[0]).lower()
+        if exe.endswith('.exe'):
+            exe = exe[:-4]
+        return exe == 'ping'
 
     def _change_directory_and_respond(self, client_id, cmd):
         client = self.clients.get(client_id)
@@ -312,11 +557,24 @@ class UDPServer:
         if client_id in self.clients:
             self._send_reliable(client_id, output.encode('utf-8'))
 
-    def _stream_pipe(self, client_id, pipe):
+    def _normalize_interrupt_text(self, text, stop_after_marker=False):
+        text = text.replace('Control-Break', 'Control-C')
+        if not stop_after_marker:
+            return text, False
+        marker_index = text.find('Control-C')
+        if marker_index < 0:
+            return text, False
+        end = marker_index + len('Control-C')
+        while end < len(text) and text[end] in '\r\n':
+            end += 1
+        return text[:end], True
+
+    def _stream_pipe(self, client_id, pipe, cmd=None):
         try:
             utf8_decoder = codecs.getincrementaldecoder('utf-8')(errors='strict')
             local_decoder = codecs.getincrementaldecoder(self.encoding)(errors='replace')
             use_utf8 = True
+            suppress_after_interrupt = os.name == 'nt' and self._is_ping_command(cmd)
             read_chunk = pipe.read1 if hasattr(pipe, 'read1') else pipe.read
             while self.running:
                 chunk = read_chunk(4096)
@@ -331,6 +589,12 @@ class UDPServer:
                         text = local_decoder.decode(pending + chunk)
                 else:
                     text = local_decoder.decode(chunk)
+                if os.name == 'nt':
+                    text, interrupted = self._normalize_interrupt_text(text, suppress_after_interrupt)
+                    if interrupted:
+                        if text:
+                            self._send_output_reliable(client_id, text.encode('utf-8'))
+                        break
                 if text and not self._send_output_reliable(client_id, text.encode('utf-8')):
                     break
             if use_utf8:
@@ -341,6 +605,8 @@ class UDPServer:
                     tail = local_decoder.decode(pending, final=True)
             else:
                 tail = local_decoder.decode(b'', final=True)
+            if os.name == 'nt':
+                tail, _ = self._normalize_interrupt_text(tail, suppress_after_interrupt)
             if tail:
                 self._send_output_reliable(client_id, tail.encode('utf-8'))
         except Exception as e:
@@ -365,7 +631,7 @@ class UDPServer:
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     cwd=client.cwd,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
                     shell=True
@@ -381,11 +647,12 @@ class UDPServer:
 
             with client.process_lock:
                 client.current_process = proc
+                client.current_command = cmd
 
             for pipe in (proc.stdout, proc.stderr):
                 if pipe is None:
                     continue
-                thread = threading.Thread(target=self._stream_pipe, args=(client_id, pipe), daemon=True)
+                thread = threading.Thread(target=self._stream_pipe, args=(client_id, pipe, cmd), daemon=True)
                 thread.start()
                 reader_threads.append(thread)
 
@@ -411,8 +678,192 @@ class UDPServer:
                 with client.process_lock:
                     if client.current_process == proc:
                         client.current_process = None
+                        client.current_command = None
             if client_id in self.clients:
                 self._send_output_done(client_id)
+
+    def _execute_pty_and_respond(self, client_id, cmd):
+        cmd = strip_pty_prefix(cmd)
+        if not cmd:
+            self._send_reliable(client_id, b"Error: empty PTY command\n")
+            return
+        if os.name == 'nt':
+            self._execute_windows_pty_and_respond(client_id, cmd)
+        else:
+            self._execute_posix_pty_and_respond(client_id, cmd)
+
+    def _execute_posix_pty_and_respond(self, client_id, cmd):
+        client = self.clients.get(client_id)
+        if not client:
+            return
+
+        master_fd = None
+        slave_fd = None
+        proc = None
+        try:
+            master_fd, slave_fd = pty.openpty()
+            self._set_pty_size_fd(slave_fd, client.term_rows, client.term_cols)
+            proc = subprocess.Popen(
+                ['bash', '-lc', cmd],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=client.cwd,
+                preexec_fn=os.setsid,
+                close_fds=True
+            )
+            os.close(slave_fd)
+            slave_fd = None
+
+            with client.process_lock:
+                client.current_process = proc
+            with client.pty_lock:
+                client.pty_fd = master_fd
+                client.pty_session = None
+                client.is_interactive = True
+                client.stdin_recv_expected_seq = 0
+            self._flush_pending_stdin(client)
+
+            while self.running and proc.poll() is None:
+                self._flush_pending_stdin(client)
+                readable, _, _ = select.select([master_fd], [], [], 0.1)
+                if not readable:
+                    continue
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                if not self._send_output_reliable(client_id, chunk):
+                    break
+
+            try:
+                while True:
+                    readable, _, _ = select.select([master_fd], [], [], 0)
+                    if not readable:
+                        break
+                    chunk = os.read(master_fd, 4096)
+                    if not chunk:
+                        break
+                    if not self._send_output_reliable(client_id, chunk):
+                        break
+            except OSError:
+                pass
+
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self._kill_process_tree(proc)
+        except Exception as e:
+            self._send_output_reliable(client_id, f"Error: {str(e)}\n".encode('utf-8'))
+        finally:
+            with client.pty_lock:
+                if client.pty_fd == master_fd:
+                    client.pty_fd = None
+                client.pty_session = None
+                client.is_interactive = False
+                client.pending_stdin = []
+                client.stdin_event.clear()
+            with client.process_lock:
+                if proc is not None and client.current_process == proc:
+                    client.current_process = None
+            for fd in (master_fd, slave_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            if client_id in self.clients:
+                self._send_output_done(client_id)
+
+    def _read_available_windows_pty_output(self, session, first_chunk):
+        chunks = [first_chunk]
+        total = len(first_chunk)
+        while total < MAX_DATA_SIZE:
+            chunk = session.read(MAX_DATA_SIZE - total, timeout=0)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b''.join(chunks)
+
+    def _execute_windows_pty_and_respond(self, client_id, cmd):
+        client = self.clients.get(client_id)
+        if not client:
+            return
+
+        session = None
+        try:
+            session = WindowsPtySession(cmd, client.cwd, client.term_rows, client.term_cols)
+            with client.pty_lock:
+                client.pty_session = session
+                client.pty_fd = None
+                client.is_interactive = True
+                client.stdin_recv_expected_seq = 0
+            self._flush_pending_stdin(client)
+
+            while self.running and session.is_alive():
+                self._flush_pending_stdin(client)
+                chunk = session.read(4096)
+                if chunk:
+                    chunk = self._read_available_windows_pty_output(session, chunk)
+                    if not self._send_output_reliable(client_id, chunk):
+                        break
+                elif not session.is_alive():
+                    break
+
+            drain_until = time.monotonic() + 1
+            while self.running and time.monotonic() < drain_until:
+                chunk = session.read(4096, timeout=0.1)
+                if not chunk:
+                    continue
+                chunk = self._read_available_windows_pty_output(session, chunk)
+                drain_until = time.monotonic() + 0.2
+                if not self._send_output_reliable(client_id, chunk):
+                    break
+        except Exception as e:
+            self._send_output_reliable(client_id, f"Error: {str(e)}\n".encode('utf-8'))
+        finally:
+            with client.pty_lock:
+                if client.pty_session == session:
+                    client.pty_session = None
+                client.is_interactive = False
+                client.pending_stdin = []
+                client.stdin_event.clear()
+            if session is not None:
+                try:
+                    session.terminate()
+                except Exception:
+                    pass
+            if client_id in self.clients:
+                self._send_output_done(client_id)
+
+    def _cleanup_client_runtime(self, client):
+        with client.pty_lock:
+            session = client.pty_session
+            fd = client.pty_fd
+            client.pty_session = None
+            client.pty_fd = None
+            client.is_interactive = False
+            client.pending_stdin = []
+            client.stdin_event.clear()
+        if session is not None:
+            try:
+                session.terminate()
+            except Exception:
+                pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        with client.process_lock:
+            proc = client.current_process
+            client.current_process = None
+            client.current_command = None
+        if proc and proc.poll() is None:
+            self._kill_process_tree(proc)
 
     def _cleanup_loop(self):
         while self.running:
@@ -420,10 +871,7 @@ class UDPServer:
             to_remove = []
             for cid, client in list(self.clients.items()):
                 if now - client.last_heartbeat > 30:
-                    with client.process_lock:
-                        proc = client.current_process
-                    if proc and proc.poll() is None:
-                        self._kill_process_tree(proc)
+                    self._cleanup_client_runtime(client)
                     to_remove.append(cid)
             for cid in to_remove:
                 print(f"Client {cid} timed out, removed")

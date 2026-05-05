@@ -109,11 +109,114 @@ def recv_realtime_response(sock, cid, addr, timeout=5):
                         expected = next_data_seq(expected)
                 elif is_sequence_ahead(seq, expected):
                     buffered.setdefault(seq, payload)
-                sock.settimeout(1)
+                sock.settimeout(3)
     except socket.timeout:
         pass
     recv_expected[cid] = expected
     return got_ack, all_data, first_output_at, time.monotonic() - started
+
+
+def recv_response_with_window(sock, cid, addr, advertised_packets=1, timeout=5):
+    got_ack = False
+    all_data = b''
+    expected = recv_expected.get(cid, 0)
+    buffered = {}
+    done = False
+
+    def process_payload(payload):
+        nonlocal all_data, done
+        if unpack_output_done(payload) is not None:
+            done = True
+        else:
+            all_data += payload
+
+    sock.settimeout(timeout)
+    try:
+        while not done:
+            resp_data, _ = sock.recvfrom(65535)
+            resp = unpack_msg(resp_data)
+            if resp is None:
+                continue
+            if resp[0] == TYPE_ACK:
+                got_ack = True
+            elif resp[0] == TYPE_OUTPUT:
+                seq = resp[1]
+                payload = resp[3]
+                ack_payload = pack_window_update(advertised_packets, RECV_BUFFER_LIMIT_BYTES)
+                ack = pack_msg(TYPE_ACK, seq, cid, ack_payload)
+                sock.sendto(ack, addr)
+                if seq == expected:
+                    process_payload(payload)
+                    expected = next_data_seq(expected)
+                    while expected in buffered and not done:
+                        process_payload(buffered.pop(expected))
+                        expected = next_data_seq(expected)
+                elif is_sequence_ahead(seq, expected):
+                    buffered.setdefault(seq, payload)
+                sock.settimeout(1)
+    except socket.timeout:
+        pass
+    recv_expected[cid] = expected
+    return got_ack, all_data
+
+
+def recv_pty_response(sock, cid, addr, stdin_data, timeout=8, send_after_output=False):
+    got_ack = False
+    stdin_sent = False
+    all_data = b''
+    expected = recv_expected.get(cid, 0)
+    buffered = {}
+    done = False
+    stdin_seq = 0
+
+    def send_stdin_once():
+        nonlocal stdin_sent, stdin_seq
+        if stdin_sent:
+            return
+        for i in range(0, len(stdin_data), MAX_DATA_SIZE):
+            chunk = stdin_data[i:i + MAX_DATA_SIZE]
+            sock.sendto(pack_msg(TYPE_STDIN, stdin_seq, cid, chunk), addr)
+            stdin_seq = next_data_seq(stdin_seq)
+        stdin_sent = True
+
+    def process_payload(payload):
+        nonlocal all_data, done
+        if unpack_output_done(payload) is not None:
+            done = True
+        else:
+            all_data += payload
+
+    sock.settimeout(timeout)
+    try:
+        while not done:
+            resp_data, _ = sock.recvfrom(65535)
+            resp = unpack_msg(resp_data)
+            if resp is None:
+                continue
+            if resp[0] == TYPE_ACK:
+                got_ack = True
+                if not send_after_output:
+                    send_stdin_once()
+            elif resp[0] == TYPE_OUTPUT:
+                seq = resp[1]
+                payload = resp[3]
+                if send_after_output:
+                    send_stdin_once()
+                ack_payload = pack_window_update(OUTPUT_WINDOW_SIZE, RECV_BUFFER_LIMIT_BYTES)
+                sock.sendto(pack_msg(TYPE_ACK, seq, cid, ack_payload), addr)
+                if seq == expected:
+                    process_payload(payload)
+                    expected = next_data_seq(expected)
+                    while expected in buffered and not done:
+                        process_payload(buffered.pop(expected))
+                        expected = next_data_seq(expected)
+                elif is_sequence_ahead(seq, expected):
+                    buffered.setdefault(seq, payload)
+                sock.settimeout(timeout)
+    except socket.timeout:
+        pass
+    recv_expected[cid] = expected
+    return got_ack, all_data
 
 
 print("=" * 60, flush=True)
@@ -133,7 +236,7 @@ else:
 
 log_test("Magic matches guide", MAGIC == 0x5554)
 log_test("Header size matches guide", HEADER_SIZE == 13)
-log_test("Message types match guide", (TYPE_COMMAND, TYPE_OUTPUT, TYPE_ACK, TYPE_HEARTBEAT, TYPE_INTERRUPT) == (0x01, 0x02, 0x03, 0x04, 0x05))
+log_test("Message types match guide", (TYPE_COMMAND, TYPE_OUTPUT, TYPE_ACK, TYPE_HEARTBEAT, TYPE_INTERRUPT, TYPE_STDIN, TYPE_RESIZE, TYPE_WINDOW_UPDATE) == (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08))
 
 fake_header = struct.pack(HEADER_FORMAT, 0xFFFF, TYPE_COMMAND, 0, 5, 1)
 log_test("Invalid magic rejected", unpack_msg(fake_header + b'hello') is None)
@@ -164,6 +267,20 @@ log_test("ANSI escape stripped", strip_ansi_sequences(b'\x1b[31mRED\x1b[0m') == 
 log_test("Tab preserved", normalize_command_input('echo\tTAB_OK\n') == 'echo\tTAB_OK\n')
 log_test("ANSI input normalized", normalize_command_input('echo \x1b[31mANSI_OK\x1b[0m\n') == 'echo ANSI_OK\n')
 
+print("\n[1c] High-Level Protocol Helpers", flush=True)
+resize_payload = pack_resize(40, 120)
+window_payload = pack_window_update(3, 4096)
+log_test("Resize payload roundtrip", unpack_resize(resize_payload) == (40, 120))
+log_test("Invalid resize rejected", unpack_resize(b'bad') is None)
+log_test("Window update roundtrip", unpack_window_update(window_payload) == (3, 4096))
+log_test("Invalid window update rejected", unpack_window_update(b'bad') is None)
+log_test("PTY command prefix detected", should_use_pty_command('pty bash'))
+log_test("Fullscreen command detected", should_use_pty_command('vim README.md'))
+log_test("Ping command stays on normal path", not should_use_pty_command('ping 127.0.0.1'))
+log_test("Plain python command not PTY", not should_use_pty_command('python -c "print(1)"'))
+log_test("Plain echo command not PTY", not should_use_pty_command('echo OK'))
+log_test("PTY prefix stripped", strip_pty_prefix('pty vim README.md') == 'vim README.md')
+
 # ===== Start server =====
 print("\n[2] Starting UDP server...", flush=True)
 from server import UDPServer
@@ -173,6 +290,8 @@ threading.Thread(target=server._recv_loop, daemon=True).start()
 threading.Thread(target=server._cleanup_loop, daemon=True).start()
 time.sleep(0.5)
 addr = ('127.0.0.1', TEST_PORT)
+filtered_interrupt, saw_interrupt = server._normalize_interrupt_text('Control-Break\r\nReply after interrupt', True)
+log_test("Ping interrupt tail filtered", saw_interrupt and filtered_interrupt == 'Control-C\r\n')
 
 # ===== Test 2: Heartbeat =====
 print("\n[2] Heartbeat", flush=True)
@@ -190,10 +309,38 @@ except socket.timeout:
     log_test("Heartbeat ACK received", False, "timeout")
 sock_hb.close()
 
+print("\n[2a] Resize and Flow-Control State", flush=True)
+sock_state = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock_state.settimeout(2)
+cid_state = 10018
+sock_state.sendto(pack_msg(TYPE_RESIZE, 0, cid_state, pack_resize(33, 101)), addr)
+try:
+    resp_data, _ = sock_state.recvfrom(1500)
+    resp = unpack_msg(resp_data)
+    client_state = server.clients.get(cid_state)
+    log_test("Resize ACK received", resp is not None and resp[0] == TYPE_ACK and resp[1] == 0)
+    log_test("Resize state updated", client_state is not None and client_state.term_rows == 33 and client_state.term_cols == 101)
+except socket.timeout:
+    log_test("Resize ACK received", False, "timeout")
+    log_test("Resize state updated", False, "timeout")
+
+sock_state.sendto(pack_msg(TYPE_WINDOW_UPDATE, 0, cid_state, pack_window_update(2, 2048)), addr)
+time.sleep(0.2)
+client_state = server.clients.get(cid_state)
+log_test("Window update state updated", client_state is not None and client_state.advertised_window_packets == 2 and client_state.advertised_window_bytes == 2048)
+sock_state.close()
+
 # ===== Test 2b: Client Connection Check =====
 print("\n[2b] Client Connection Check", flush=True)
 from client import UDPClient
 client_ok = UDPClient('127.0.0.1', TEST_PORT)
+log_test("Windows PTY Backspace maps to DEL", os.name != 'nt' or client_ok._windows_char_to_input_bytes('\b') == b'\x7f')
+log_test("Windows PTY Chinese input encoded", os.name != 'nt' or client_ok._windows_char_to_input_bytes('中') == '中'.encode('utf-8'))
+if os.name == 'nt':
+    client_ok.pending_windows_high_surrogate = '\ud83d'
+    log_test("Windows PTY surrogate pair encoded", client_ok._windows_char_to_input_bytes('\ude00') == '😀'.encode('utf-8'))
+else:
+    log_test("Windows PTY surrogate pair encoded", True, "non-Windows")
 client_ok.running = True
 threading.Thread(target=client_ok._recv_loop, daemon=True).start()
 log_test("Client startup detects reachable server", client_ok._connect_to_server(timeout=2))
@@ -248,11 +395,10 @@ sock_quote.close()
 time.sleep(0.3)
 
 print("\n[3b] Advanced Output", flush=True)
+rt_cmd = 'python -c "import time; print(\'RT1\', flush=True); time.sleep(1.5); print(\'RT2\', flush=True)"'
 if os.name == 'nt':
-    rt_cmd = 'ping -n 3 127.0.0.1'
     large_cmd = 'for /L %i in (1,1,1000) do @echo XXXXXXXXXX'
 else:
-    rt_cmd = 'python -c "import time; print(\'RT1\', flush=True); time.sleep(1.5); print(\'RT2\', flush=True)"'
     large_cmd = 'python -c "print(\'X\' * 8000)"'
 
 cid_rt = 10013
@@ -261,10 +407,7 @@ sock_rt.sendto(pack_msg(TYPE_COMMAND, 0, cid_rt, rt_cmd.encode('utf-8')), addr)
 got_rt_ack, rt_out, first_rt_at, total_rt_time = recv_realtime_response(sock_rt, cid_rt, addr, timeout=8)
 rt_str = rt_out.decode('utf-8', errors='replace')
 log_test("Real-time output ACK received", got_rt_ack)
-if os.name == 'nt':
-    log_test("Real-time output complete", len(rt_out) > 0, f"out={rt_str[:120]}")
-else:
-    log_test("Real-time output complete", "RT1" in rt_str and "RT2" in rt_str, f"out={rt_str[:120]}")
+log_test("Real-time output complete", "RT1" in rt_str and "RT2" in rt_str, f"out={rt_str[:120]}")
 log_test("First output before command exit", first_rt_at is not None and first_rt_at < total_rt_time - 0.5,
          f"first={first_rt_at}, total={total_rt_time}")
 sock_rt.close()
@@ -275,6 +418,13 @@ sock_large.sendto(pack_msg(TYPE_COMMAND, 0, cid_large, large_cmd.encode('utf-8')
 _, large_out = recv_response(sock_large, cid_large, addr, timeout=8)
 log_test("Large output over window complete", large_out.count(b'X') >= 8000, f"len={len(large_out)}")
 sock_large.close()
+
+cid_flow = 10019
+sock_flow = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock_flow.sendto(pack_msg(TYPE_COMMAND, 0, cid_flow, large_cmd.encode('utf-8')), addr)
+_, flow_out = recv_response_with_window(sock_flow, cid_flow, addr, advertised_packets=1, timeout=8)
+log_test("Large output with advertised receive window complete", flow_out.count(b'X') >= 8000, f"len={len(flow_out)}")
+sock_flow.close()
 time.sleep(0.3)
 
 # ===== Test 4: Multiple Clients =====
@@ -366,6 +516,55 @@ log_test("Tab passed to shell", "TAB_OK" in ctrl3_str, f"out={ctrl3_str[:80]}")
 sock_ctrl3.close()
 time.sleep(0.3)
 
+print("\n[7b] Interrupt Output Ordering", flush=True)
+if os.name == 'nt':
+    cid_ping = 10021
+    sock_ping = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock_ping.settimeout(12)
+    sock_ping.sendto(pack_msg(TYPE_COMMAND, 0, cid_ping, b'ping 127.0.0.1'), addr)
+    got_ping_ack = False
+    sent_ping_interrupt = False
+    ping_done = False
+    ping_out = b''
+    expected = recv_expected.get(cid_ping, 0)
+    try:
+        while not ping_done:
+            resp_data, _ = sock_ping.recvfrom(65535)
+            resp = unpack_msg(resp_data)
+            if resp is None:
+                continue
+            if resp[0] == TYPE_ACK:
+                got_ping_ack = True
+            elif resp[0] == TYPE_OUTPUT:
+                seq = resp[1]
+                payload = resp[3]
+                sock_ping.sendto(pack_msg(TYPE_ACK, seq, cid_ping, pack_window_update(OUTPUT_WINDOW_SIZE, RECV_BUFFER_LIMIT_BYTES)), addr)
+                if seq != expected:
+                    continue
+                expected = next_data_seq(expected)
+                if unpack_output_done(payload) is not None:
+                    ping_done = True
+                    continue
+                ping_out += payload
+                ping_text = ping_out.decode('utf-8', errors='replace')
+                if not sent_ping_interrupt and 'TTL=' in ping_text:
+                    sock_ping.sendto(pack_msg(TYPE_INTERRUPT, 0, cid_ping, b''), addr)
+                    sent_ping_interrupt = True
+    except socket.timeout:
+        pass
+    recv_expected[cid_ping] = expected
+    ping_text = ping_out.decode('utf-8', errors='replace')
+    control_c_index = ping_text.find('Control-C')
+    trailing_after_interrupt = ping_text[control_c_index:] if control_c_index >= 0 else ''
+    log_test("Windows ping interrupt ACK received", got_ping_ack)
+    log_test("Windows ping interrupt sent", sent_ping_interrupt)
+    log_test("Windows ping interrupt uses Control-C", 'Control-C' in ping_text and 'Control-Break' not in ping_text, f"out={ping_text[-200:]}")
+    log_test("Windows ping has no reply after interrupt marker", control_c_index >= 0 and 'TTL=' not in trailing_after_interrupt, f"out={ping_text[-200:]}")
+    sock_ping.close()
+else:
+    log_test("Windows ping interrupt ordering skipped", True, "non-Windows")
+time.sleep(0.3)
+
 # ===== Test 8: Error Handling =====
 print("\n[8] Error Handling", flush=True)
 cid_err = 10009
@@ -418,6 +617,35 @@ if os.name == 'nt':
 else:
     log_test("cd affects later commands", pwd_str == expected_parent, f"out={pwd_str}, expected={expected_parent}")
 sock_pwd.close()
+
+time.sleep(0.3)
+print("\n[11] PTY Simplified Interaction", flush=True)
+cid_pty = 10020
+sock_pty = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+if os.name == 'nt':
+    try:
+        import winpty  # noqa: F401
+        has_winpty = True
+    except ImportError:
+        has_winpty = False
+
+    sock_pty.sendto(pack_msg(TYPE_COMMAND, 0, cid_pty, b'pty cmd'), addr)
+    if has_winpty:
+        got_pty_ack, pty_out = recv_pty_response(sock_pty, cid_pty, addr, b'echo PTY_OK\rexit\r', timeout=8, send_after_output=True)
+        pty_str = pty_out.decode('utf-8', errors='replace')
+        log_test("Windows PTY command ACK received", got_pty_ack)
+        log_test("Windows PTY interaction works", "PTY_OK" in pty_str, f"out={pty_str[:120]}")
+    else:
+        got_pty_ack, pty_out = recv_response(sock_pty, cid_pty, addr, timeout=5)
+        pty_str = pty_out.decode('utf-8', errors='replace')
+        log_test("Windows PTY missing dependency reported", got_pty_ack and "pywinpty" in pty_str, f"out={pty_str[:120]}")
+else:
+    sock_pty.sendto(pack_msg(TYPE_COMMAND, 0, cid_pty, b'pty sh'), addr)
+    got_pty_ack, pty_out = recv_pty_response(sock_pty, cid_pty, addr, b'echo PTY_OK\nexit\n', timeout=8)
+    pty_str = pty_out.decode('utf-8', errors='replace')
+    log_test("POSIX PTY command ACK received", got_pty_ack)
+    log_test("POSIX PTY interaction works", "PTY_OK" in pty_str, f"out={pty_str[:120]}")
+sock_pty.close()
 
 # ===== Stop server =====
 server.running = False
