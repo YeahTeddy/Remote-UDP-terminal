@@ -69,8 +69,6 @@ class UDPClient:
         self.running = False
         self.send_seq = 0
         self.recv_expected_seq = 0
-        self.recv_buffer = {}
-        self.recv_buffer_bytes = 0
         self.recv_buffer_limit_packets = RECV_BUFFER_LIMIT_PACKETS
         self.recv_buffer_limit_bytes = RECV_BUFFER_LIMIT_BYTES
         self.ack_event = threading.Event()
@@ -79,7 +77,6 @@ class UDPClient:
         self.last_heartbeat_ack = 0
         self.waiting_seq = -1
         self.stdin_seq = DATA_SEQUENCE_MOD // 3
-        self.window_update_seq = DATA_SEQUENCE_MOD // 2
         self.resize_seq = DATA_SEQUENCE_MOD * 2 // 3
         self.print_lock = threading.Lock()
         self.prompt_ready_event = threading.Event()
@@ -99,6 +96,9 @@ class UDPClient:
         self.windows_stdin_handle = self._get_windows_stdin_handle()
         self.last_rows = 24
         self.last_cols = 80
+        self.stop_event = threading.Event()
+        self.recv_thread = None
+        self.heartbeat_thread = None
         print(f"Client ID: {self.client_id}, connecting to {server_host}:{server_port}")
 
     def _format_prompt_dir(self, path):
@@ -178,25 +178,24 @@ class UDPClient:
 
     def start(self):
         self.running = True
-        recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
-        recv_thread.start()
+        self.stop_event.clear()
+        self.recv_thread = threading.Thread(target=self._recv_loop)
+        self.recv_thread.start()
         try:
             connected = self._connect_to_server()
         except KeyboardInterrupt:
-            self.running = False
-            self._close_socket()
+            self._shutdown_runtime()
             return
         if not connected:
             self._safe_print(f"Connection failed: server {self.server_addr[0]}:{self.server_addr[1]} did not respond")
-            self.running = False
-            self._close_socket()
+            self._shutdown_runtime()
             return
 
         self.connected = True
         self._install_resize_handler()
         self._send_resize()
-        heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        heartbeat_thread.start()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop)
+        self.heartbeat_thread.start()
         print("Connected to server, enter commands to execute, 'exit' to quit")
 
         try:
@@ -243,6 +242,7 @@ class UDPClient:
         finally:
             self._restore_terminal_mode()
             self._restore_resize_handler()
+            self._shutdown_runtime()
 
     def _wait_for_command_output(self):
         while self.running and not self.output_done_event.is_set():
@@ -263,15 +263,35 @@ class UDPClient:
         except OSError:
             pass
 
+    def _wake_waiters(self):
+        self.ack_event.set()
+        self.output_done_event.set()
+        self.heartbeat_ack_event.set()
+
+    def _join_background_threads(self):
+        current = threading.current_thread()
+        for thread in (self.recv_thread, self.heartbeat_thread):
+            if thread is not None and thread is not current and thread.is_alive():
+                try:
+                    thread.join(timeout=2)
+                except KeyboardInterrupt:
+                    pass
+
+    def _shutdown_runtime(self):
+        self.running = False
+        self.connected = False
+        self.stop_event.set()
+        self._wake_waiters()
+        self._close_socket()
+        self._join_background_threads()
+
     def stop(self):
         if not self.running:
             return
         self._resume_sigint()
         self._restore_terminal_mode()
         self._restore_resize_handler()
-        self.running = False
-        self.connected = False
-        self._close_socket()
+        self._shutdown_runtime()
         self._safe_print("\nClient stopped")
 
     def _send_interrupt(self):
@@ -312,18 +332,18 @@ class UDPClient:
         if self.connection_error_reported:
             return
         self.connection_error_reported = True
-        self.running = False
-        self.connected = False
         self._restore_terminal_mode()
         self._safe_print("\nConnection error: server did not respond to heartbeat, exiting")
-        self._close_socket()
+        self._shutdown_runtime()
         _thread.interrupt_main()
 
     def _heartbeat_loop(self):
         missed_heartbeats = 0
         max_missed_heartbeats = 3
         while self.running:
-            time.sleep(5)
+            retry_delay = 2 if missed_heartbeats else 5
+            if self.stop_event.wait(retry_delay):
+                break
             if not self.running:
                 break
             if self._wait_for_heartbeat_ack(timeout=2):
@@ -344,21 +364,13 @@ class UDPClient:
         self.prompt_ready_event.set()
 
     def _available_recv_window_packets(self):
-        return max(0, self.recv_buffer_limit_packets - len(self.recv_buffer))
+        return self.recv_buffer_limit_packets
 
     def _available_recv_window_bytes(self):
-        return max(0, self.recv_buffer_limit_bytes - self.recv_buffer_bytes)
+        return self.recv_buffer_limit_bytes
 
     def _make_window_update_payload(self):
         return pack_window_update(self._available_recv_window_packets(), self._available_recv_window_bytes())
-
-    def _send_window_update(self):
-        try:
-            msg = pack_msg(TYPE_WINDOW_UPDATE, self.window_update_seq, self.client_id, self._make_window_update_payload())
-            self.sock.sendto(msg, self.server_addr)
-            self.window_update_seq = next_data_seq(self.window_update_seq)
-        except Exception:
-            pass
 
     def _process_output_payload(self, payload):
         done_cwd = unpack_output_done(payload)
@@ -385,23 +397,8 @@ class UDPClient:
         if seq == self.recv_expected_seq:
             self._process_output_payload(payload)
             self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
-            while self.recv_expected_seq in self.recv_buffer:
-                buffered_payload = self.recv_buffer.pop(self.recv_expected_seq)
-                self.recv_buffer_bytes -= len(buffered_payload)
-                self._process_output_payload(buffered_payload)
-                self.recv_expected_seq = next_data_seq(self.recv_expected_seq)
-            return True
-        if is_sequence_ahead(seq, self.recv_expected_seq):
-            if seq in self.recv_buffer:
-                return True
-            if len(self.recv_buffer) >= self.recv_buffer_limit_packets:
-                return False
-            if self.recv_buffer_bytes + len(payload) > self.recv_buffer_limit_bytes:
-                return False
-            self.recv_buffer[seq] = payload
-            self.recv_buffer_bytes += len(payload)
-            return True
-        return True
+            return seq
+        return (self.recv_expected_seq - 1) % DATA_SEQUENCE_MOD
 
     def _recv_loop(self):
         while self.running:
@@ -422,12 +419,9 @@ class UDPClient:
                     if seq == self.waiting_seq:
                         self.ack_event.set()
                 elif msg_type == TYPE_OUTPUT:
-                    accepted = self._handle_output_packet(seq, payload)
-                    if accepted:
-                        ack_msg = pack_msg(TYPE_ACK, seq, self.client_id, self._make_window_update_payload())
-                        self.sock.sendto(ack_msg, self.server_addr)
-                    else:
-                        self._send_window_update()
+                    ack_seq = self._handle_output_packet(seq, payload)
+                    ack_msg = pack_msg(TYPE_ACK, ack_seq, self.client_id, self._make_window_update_payload())
+                    self.sock.sendto(ack_msg, self.server_addr)
             except socket.timeout:
                 continue
             except (ConnectionResetError, OSError):
@@ -448,6 +442,8 @@ class UDPClient:
                 msg = pack_msg(TYPE_COMMAND, self.send_seq, self.client_id, data)
                 self.sock.sendto(msg, self.server_addr)
                 if self.ack_event.wait(timeout=2):
+                    if not self.running:
+                        break
                     self.send_seq = next_data_seq(self.send_seq)
                     self.waiting_seq = -1
                     return True
@@ -455,13 +451,16 @@ class UDPClient:
                 with self.print_lock:
                     print(f"\nTimeout waiting for ACK, retrying {retry_count}/{max_retries}")
             except Exception as e:
+                if not self.running:
+                    break
                 with self.print_lock:
                     print(f"\nSend error: {e}")
                 retry_count += 1
 
         self.waiting_seq = -1
-        with self.print_lock:
-            print("\nSend failed after retries: server may be unreachable or network interrupted")
+        if self.running:
+            with self.print_lock:
+                print("\nSend failed after retries: server may be unreachable or network interrupted")
         return False
 
     def _get_terminal_size(self):
