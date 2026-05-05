@@ -625,7 +625,6 @@ class UDPServer:
 
         proc = None
         reader_threads = []
-        timed_out = False
         try:
             if os.name == 'nt':
                 proc = subprocess.Popen(
@@ -656,21 +655,10 @@ class UDPServer:
                 thread.start()
                 reader_threads.append(thread)
 
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                self._kill_process_tree(proc)
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
+            proc.wait()
 
             for thread in reader_threads:
                 thread.join()
-
-            if timed_out:
-                self._send_output_reliable(client_id, b"Error: Command execution timed out\n")
         except Exception as e:
             self._send_output_reliable(client_id, f"Error: {str(e)}\n".encode('utf-8'))
         finally:

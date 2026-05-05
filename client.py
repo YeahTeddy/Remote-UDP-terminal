@@ -320,9 +320,17 @@ class UDPClient:
         _thread.interrupt_main()
 
     def _heartbeat_loop(self):
+        missed_heartbeats = 0
+        max_missed_heartbeats = 3
         while self.running:
             time.sleep(5)
-            if self.running and not self._wait_for_heartbeat_ack(timeout=2):
+            if not self.running:
+                break
+            if self._wait_for_heartbeat_ack(timeout=2):
+                missed_heartbeats = 0
+                continue
+            missed_heartbeats += 1
+            if missed_heartbeats >= max_missed_heartbeats:
                 self._handle_connection_error()
                 break
 
