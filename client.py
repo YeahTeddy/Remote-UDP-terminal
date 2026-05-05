@@ -94,11 +94,6 @@ class UDPClient:
         self.connection_error_reported = False
         self.connected = False
         self.interactive_mode = False
-        self.command_waiting = False
-        self.interrupt_after_reconnect = False
-        self.reconnect_interrupt_reported = False
-        self.reconnect_interrupt_started_at = 0
-        self.last_reconnect_interrupt_sent = 0
         self.raw_terminal_attrs = None
         self.pending_windows_high_surrogate = None
         self.windows_stdin_handle = self._get_windows_stdin_handle()
@@ -252,55 +247,18 @@ class UDPClient:
             self._restore_resize_handler()
             self._shutdown_runtime()
 
-    def _mark_command_connection_interrupted(self):
-        if self.command_waiting and not self.interactive_mode:
-            self.interrupt_after_reconnect = True
-            self.reconnect_interrupt_reported = False
-            self.reconnect_interrupt_started_at = 0
-            self.last_reconnect_interrupt_sent = 0
-
-    def _interrupt_command_after_reconnect_if_needed(self):
-        if not self.interrupt_after_reconnect or self.interactive_mode:
-            return
-        now = time.monotonic()
-        if self.reconnect_interrupt_started_at and now - self.reconnect_interrupt_started_at >= 3:
-            with self.print_lock:
-                print("\nNo command completion received after reconnect interrupt, returning to prompt")
-            self.output_done_event.set()
-            return
-        if now - self.last_heartbeat_ack > 3:
-            return
-        if now - self.last_reconnect_interrupt_sent < 1:
-            return
-        if not self.reconnect_interrupt_reported:
-            with self.print_lock:
-                print("\nConnection restored, interrupting current command")
-            self.reconnect_interrupt_reported = True
-            self.reconnect_interrupt_started_at = now
-        self._send_interrupt()
-        self.last_reconnect_interrupt_sent = now
-
     def _wait_for_command_output(self):
-        self.command_waiting = True
-        try:
-            while self.running and not self.output_done_event.is_set():
-                self._interrupt_command_after_reconnect_if_needed()
-                try:
-                    self.output_done_event.wait(0.1)
-                except KeyboardInterrupt:
-                    if not self.running:
-                        break
-                    if self._is_suppressed_interrupt():
-                        continue
-                    if os.name != 'nt':
-                        self._print_interrupt_marker()
-                    self._send_interrupt()
-        finally:
-            self.command_waiting = False
-            self.interrupt_after_reconnect = False
-            self.reconnect_interrupt_reported = False
-            self.reconnect_interrupt_started_at = 0
-            self.last_reconnect_interrupt_sent = 0
+        while self.running and not self.output_done_event.is_set():
+            try:
+                self.output_done_event.wait(0.1)
+            except KeyboardInterrupt:
+                if not self.running:
+                    break
+                if self._is_suppressed_interrupt():
+                    continue
+                if os.name != 'nt':
+                    self._print_interrupt_marker()
+                self._send_interrupt()
 
     def _close_socket(self):
         try:
@@ -395,7 +353,6 @@ class UDPClient:
                 missed_heartbeats = 0
                 continue
             missed_heartbeats += 1
-            self._mark_command_connection_interrupted()
             if missed_heartbeats >= max_missed_heartbeats:
                 self._handle_connection_error()
                 break

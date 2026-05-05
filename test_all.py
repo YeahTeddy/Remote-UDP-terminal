@@ -394,10 +394,8 @@ try:
     client_reconnect.connected = True
     reconnect_wait_finished = threading.Event()
     reconnect_interrupt_sent = threading.Event()
-    reconnect_interrupts = []
 
     def send_reconnect_interrupt():
-        reconnect_interrupts.append(True)
         reconnect_interrupt_sent.set()
 
     client_reconnect._send_interrupt = send_reconnect_interrupt
@@ -407,37 +405,11 @@ try:
         reconnect_wait_finished.set()
 
     threading.Thread(target=wait_for_reconnected_command_output, daemon=True).start()
-    time.sleep(0.1)
-    client_reconnect._mark_command_connection_interrupted()
-    client_reconnect.last_heartbeat_ack = time.monotonic()
-    interrupt_sent = reconnect_interrupt_sent.wait(1)
+    time.sleep(0.3)
+    still_waiting_after_reconnect = not reconnect_wait_finished.is_set() and not reconnect_interrupt_sent.is_set()
     client_reconnect.output_done_event.set()
-    log_test("Command wait interrupts after heartbeat reconnect", interrupt_sent and reconnect_wait_finished.wait(1) and len(reconnect_interrupts) >= 1)
+    log_test("Command wait continues after heartbeat reconnect", still_waiting_after_reconnect and reconnect_wait_finished.wait(1))
     client_reconnect._close_socket()
-
-    client_reconnect_timeout = UDPClient('127.0.0.1', TEST_PORT)
-    client_reconnect_timeout.running = True
-    client_reconnect_timeout.connected = True
-    reconnect_timeout_finished = threading.Event()
-    reconnect_timeout_interrupt_sent = threading.Event()
-
-    def send_reconnect_timeout_interrupt():
-        reconnect_timeout_interrupt_sent.set()
-
-    client_reconnect_timeout._send_interrupt = send_reconnect_timeout_interrupt
-
-    def wait_for_reconnected_command_timeout():
-        client_reconnect_timeout._wait_for_command_output()
-        reconnect_timeout_finished.set()
-
-    threading.Thread(target=wait_for_reconnected_command_timeout, daemon=True).start()
-    time.sleep(0.1)
-    client_reconnect_timeout._mark_command_connection_interrupted()
-    client_reconnect_timeout.last_heartbeat_ack = time.monotonic()
-    timeout_interrupt_sent = reconnect_timeout_interrupt_sent.wait(1)
-    client_reconnect_timeout.reconnect_interrupt_started_at = time.monotonic() - 3.1
-    log_test("Command wait returns if reconnect interrupt gets no completion", timeout_interrupt_sent and reconnect_timeout_finished.wait(1))
-    client_reconnect_timeout._close_socket()
 
     client_shutdown = UDPClient('127.0.0.1', TEST_PORT)
     client_shutdown.running = True
