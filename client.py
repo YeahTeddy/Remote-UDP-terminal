@@ -9,7 +9,49 @@ import shutil
 import _thread
 
 if os.name == 'nt':
+    import ctypes
     import msvcrt
+    from ctypes import wintypes
+
+    STD_INPUT_HANDLE = -10
+    KEY_EVENT = 0x0001
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class _WindowsCharUnion(ctypes.Union):
+        _fields_ = [
+            ('UnicodeChar', wintypes.WCHAR),
+            ('AsciiChar', ctypes.c_char),
+        ]
+
+    class _WindowsKeyEventRecord(ctypes.Structure):
+        _fields_ = [
+            ('bKeyDown', wintypes.BOOL),
+            ('wRepeatCount', wintypes.WORD),
+            ('wVirtualKeyCode', wintypes.WORD),
+            ('wVirtualScanCode', wintypes.WORD),
+            ('uChar', _WindowsCharUnion),
+            ('dwControlKeyState', wintypes.DWORD),
+        ]
+
+    class _WindowsInputEvent(ctypes.Union):
+        _fields_ = [
+            ('KeyEvent', _WindowsKeyEventRecord),
+            ('RawEvent', ctypes.c_byte * 20),
+        ]
+
+    class _WindowsInputRecord(ctypes.Structure):
+        _fields_ = [
+            ('EventType', wintypes.WORD),
+            ('Event', _WindowsInputEvent),
+        ]
+
+    _kernel32 = ctypes.windll.kernel32
+    _kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+    _kernel32.GetStdHandle.restype = wintypes.HANDLE
+    _kernel32.GetNumberOfConsoleInputEvents.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.GetNumberOfConsoleInputEvents.restype = wintypes.BOOL
+    _kernel32.ReadConsoleInputW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_WindowsInputRecord), wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.ReadConsoleInputW.restype = wintypes.BOOL
 else:
     import select
     import termios
@@ -54,6 +96,7 @@ class UDPClient:
         self.interactive_mode = False
         self.raw_terminal_attrs = None
         self.pending_windows_high_surrogate = None
+        self.windows_stdin_handle = self._get_windows_stdin_handle()
         self.last_rows = 24
         self.last_cols = 80
         print(f"Client ID: {self.client_id}, connecting to {server_host}:{server_port}")
@@ -488,6 +531,17 @@ class UDPClient:
                 return False
         return True
 
+    def _get_windows_stdin_handle(self):
+        if os.name != 'nt':
+            return None
+        try:
+            handle = _kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        except Exception:
+            return None
+        if handle in (None, 0, INVALID_HANDLE_VALUE):
+            return None
+        return handle
+
     def _windows_special_key_to_bytes(self, code):
         mapping = {
             'H': b'\x1b[A',
@@ -499,6 +553,15 @@ class UDPClient:
             'S': b'\x1b[3~',
             'I': b'\x1b[5~',
             'Q': b'\x1b[6~',
+            0x26: b'\x1b[A',
+            0x28: b'\x1b[B',
+            0x27: b'\x1b[C',
+            0x25: b'\x1b[D',
+            0x24: b'\x1b[H',
+            0x23: b'\x1b[F',
+            0x2E: b'\x1b[3~',
+            0x21: b'\x1b[5~',
+            0x22: b'\x1b[6~',
         }
         return mapping.get(code, b'')
 
@@ -524,13 +587,54 @@ class UDPClient:
             return b''
         return ch.encode('utf-8', errors='ignore')
 
+    def _read_windows_console_key(self):
+        handle = self.windows_stdin_handle
+        if handle is None:
+            return None
+        pending = wintypes.DWORD()
+        try:
+            if not _kernel32.GetNumberOfConsoleInputEvents(handle, ctypes.byref(pending)):
+                return None
+            if pending.value == 0:
+                return None
+
+            chunks = []
+            record = _WindowsInputRecord()
+            read = wintypes.DWORD()
+            for _ in range(pending.value):
+                if not _kernel32.ReadConsoleInputW(handle, ctypes.byref(record), 1, ctypes.byref(read)):
+                    return None
+                if read.value == 0:
+                    break
+                if record.EventType != KEY_EVENT:
+                    continue
+                event = record.Event.KeyEvent
+                if not event.bKeyDown:
+                    continue
+                ch = event.uChar.UnicodeChar
+                repeat = max(1, event.wRepeatCount)
+                if ch and ch != '\x00':
+                    data = self._windows_char_to_input_bytes(ch)
+                else:
+                    data = self._windows_special_key_to_bytes(event.wVirtualKeyCode)
+                if data:
+                    chunks.extend(data for _ in range(repeat))
+            return b''.join(chunks)
+        except Exception:
+            return None
+
     def _read_windows_key(self):
+        data = self._read_windows_console_key()
+        if data is not None:
+            return data
         if not msvcrt.kbhit():
             return None
         chunks = []
         while msvcrt.kbhit():
             ch = msvcrt.getwch()
             if ch in ('\x00', '\xe0'):
+                if not msvcrt.kbhit():
+                    continue
                 code = msvcrt.getwch()
                 data = self._windows_special_key_to_bytes(code)
             else:
