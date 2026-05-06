@@ -738,7 +738,6 @@ python client.py 8.137.157.233 9999
 python3 -c "print('Y' * 8000)"
 ```
 
-
 ### 测试步骤
 
 1. 客户端发送大输出命令。
@@ -775,46 +774,18 @@ python3 -c "print('Y' * 8000)"
 - 进入 PTY 模式时使用保存的终端尺寸
 - PTY 运行中收到 Resize 可更新伪终端大小
 
-### 测试命令
+  采用滑动窗口的抓包来看
 
-协议级 Resize 测试命令：
+### 图片
 
-```powershell
-cd e:\files_for_webexp\UDP
-python -c "import socket,sys,os,time; sys.path.insert(0,os.getcwd()); from common import *; A=('8.137.157.233',9999); cid=98113; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(5); s.sendto(pack_msg(TYPE_COMMAND,0,cid,b'echo CREATE_FOR_RESIZE'),A); print('client created'); s.sendto(pack_msg(TYPE_RESIZE,0,cid,pack_resize(40,120)),A); data,_=s.recvfrom(1500); msg=unpack_msg(data); print('resize_ack=', bool(msg and msg[0]==TYPE_ACK and msg[1]==0))"
-```
+    客户端发送 type 07的窗口大小同步包，序列号为aa aa aa aa![1778052801184](image/Linux功能实现与测试验证报告/1778052801184.png)
 
-正式客户端中可进入 PTY 后查看窗口大小：
 
-```bash
-pty sh
-stty size
-exit
-```
 
-### 测试步骤
+服务端回复 aa aa aa aa的窗口大小同步确认包
 
-1. 先使用同一个 `client_id` 发送普通命令，确保服务端创建客户端状态。
-2. 客户端发送 `TYPE_RESIZE` 报文。
-3. Resize payload 中携带 `rows=40`、`cols=120`。
-4. 服务端收到 Resize 后返回 ACK。
-5. 客户端检查 ACK 序列号是否匹配。
-6. 如需人工演示，进入 `pty sh` 后执行 `stty size`。
-7. 调整本地终端窗口后再次验证尺寸变化。
+![1778053024701](image/Linux功能实现与测试验证报告/1778053024701.png)
 
-### 测试结果
-
-```text
-[PASS] resize ACK after client exists - seq=0
-```
-
-结论：终端窗口大小同步 WINCH / Resize 通过。
-
-### 图片占位
-
-![截图占位-终端窗口大小同步](./images/12-resize-winch.png)
-
-> 截图要求：展示 `resize ACK after client exists - seq=0`，或展示 PTY 中 `stty size` 的窗口尺寸结果。
 
 ---
 
