@@ -1,3 +1,9 @@
+"""UDP 远程终端服务端。
+
+服务端监听 UDP 数据包，维护每个客户端的会话状态，执行普通命令或交互式 PTY
+命令，并通过 ACK、滑动窗口、重传和心跳响应在 UDP 上提供可用的远程终端体验。
+"""
+
 import codecs
 import importlib
 import select
@@ -12,6 +18,7 @@ import shlex
 import getpass
 import platform
 
+# POSIX 使用系统 pty/fcntl/ioctl 管理伪终端；Windows 走 pywinpty 封装。
 if os.name != 'nt':
     import fcntl
     import pty
@@ -27,13 +34,17 @@ from common import *
 
 
 class WindowsPtySession:
+    """封装 pywinpty，提供与 POSIX PTY 相近的 read/write/resize 接口。"""
+
     def __init__(self, cmd, cwd, rows, cols):
+        """启动 Windows PTY 子进程，并兼容不同 pywinpty 版本的参数签名。"""
         try:
             PtyProcess = importlib.import_module('winpty').PtyProcess
         except ImportError as exc:
             raise RuntimeError("Windows PTY requires pywinpty; install it with: pip install pywinpty") from exc
 
         last_error = None
+        # pywinpty 的 spawn 参数在不同版本中不完全一致，因此按能力逐级降级尝试。
         for kwargs in (
             {'cwd': cwd, 'dimensions': (rows, cols)},
             {'cwd': cwd},
@@ -51,6 +62,7 @@ class WindowsPtySession:
         self.resize(rows, cols)
 
     def read(self, max_bytes=4096, timeout=0.005):
+        """读取 PTY 输出；没有数据时返回空字节，便于主循环轮询。"""
         fileobj = getattr(self.proc, 'fileobj', None)
         if fileobj is not None:
             readable, _, _ = select.select([fileobj], [], [], timeout)
@@ -71,11 +83,13 @@ class WindowsPtySession:
         return data.encode('utf-8', errors='replace')
 
     def write(self, data):
+        """把客户端传来的 UTF-8 字节增量解码后写入 Windows PTY。"""
         text = self.stdin_decoder.decode(data)
         if text:
             self.proc.write(text)
 
     def resize(self, rows, cols):
+        """调用当前 pywinpty 版本支持的尺寸调整方法。"""
         for name in ('setwinsize', 'set_winsize', 'resize'):
             method = getattr(self.proc, name, None)
             if not method:
@@ -114,19 +128,30 @@ class WindowsPtySession:
 
 
 class ClientInfo:
+    """保存单个客户端的网络、命令执行、流控和 PTY 会话状态。"""
+
     def __init__(self, addr):
+        """为新客户端初始化序列号、工作目录和运行时资源引用。"""
         self.addr = addr
         self.last_heartbeat = time.time()
+
+        # recv_expected_seq 防止重复执行命令；send_seq 负责服务端输出的可靠传输。
         self.recv_expected_seq = 0
         self.send_seq = 0
         self.cwd = os.getcwd()
+
+        # 当前子进程用于 Ctrl+C 中断和客户端清理时终止命令树。
         self.current_process = None
         self.current_command = None
         self.process_lock = threading.Lock()
+
+        # 输出窗口由客户端 ACK 中上报，服务端据此限制未确认的输出包。
         self.send_lock = threading.Lock()
         self.advertised_window_packets = OUTPUT_WINDOW_SIZE
         self.advertised_window_bytes = RECV_BUFFER_LIMIT_BYTES
         self.window_lock = threading.Lock()
+
+        # 交互式命令可能使用 POSIX fd 或 Windows pywinpty session，两者只会存在一个。
         self.pty_fd = None
         self.pty_session = None
         self.pty_lock = threading.Lock()
@@ -139,14 +164,20 @@ class ClientInfo:
 
 
 class UDPServer:
+    """监听 UDP 请求，执行远端命令，并把输出可靠发送回对应客户端。"""
+
     def __init__(self, host='0.0.0.0', port=9999):
+        """创建 UDP socket，并初始化客户端表、ACK 等待表和服务端提示符信息。"""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, port))
+        # clients 保存所有活动客户端；ack_events 用于输出包等待对应 ACK。
         self.clients = {}
         self.ack_events = {}
         self.ack_lock = threading.Lock()
         self.running = False
+
+        # 普通子进程输出可能不是 UTF-8，必要时按本地编码兜底解码再统一发 UTF-8。
         self.encoding = locale.getpreferredencoding(False) or 'utf-8'
         self.server_user = getpass.getuser()
         self.server_host = platform.node() or socket.gethostname()
@@ -154,6 +185,7 @@ class UDPServer:
         print(f"UDP Server started on {host}:{port}")
 
     def start(self):
+        """启动接收线程和清理线程，并阻塞到用户按 Ctrl+C 停止服务。"""
         self.running = True
         recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         recv_thread.start()
@@ -167,6 +199,7 @@ class UDPServer:
             self.stop()
 
     def stop(self):
+        """停止服务端，并释放每个客户端仍在运行的子进程和 PTY 资源。"""
         self.running = False
         for client in list(self.clients.values()):
             self._cleanup_client_runtime(client)
@@ -174,6 +207,7 @@ class UDPServer:
         print("Server stopped")
 
     def _recv_loop(self):
+        """服务端主接收循环，解析 UDP 包并按消息类型分发处理。"""
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(1500)
@@ -183,6 +217,7 @@ class UDPServer:
                 msg_type, seq, client_id, payload = msg
 
                 if client_id not in self.clients:
+                    # 首次见到 client_id 时创建会话；之后同一 client_id 可更新来源地址以支持端口变化。
                     self.clients[client_id] = ClientInfo(addr)
                     print(f"New client connected: {client_id} from {addr}")
 
@@ -209,6 +244,7 @@ class UDPServer:
                     print(f"Recv error: {e}")
 
     def _handle_heartbeat(self, client_id, seq, addr):
+        """回复心跳 ACK，并把远端提示符信息同步给客户端。"""
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         print(f"[{timestamp}] Heartbeat received from client {client_id} at {addr}")
         client = self.clients[client_id]
@@ -217,6 +253,7 @@ class UDPServer:
         self.sock.sendto(ack_msg, addr)
 
     def _handle_ack(self, client_id, seq, payload=b''):
+        """处理客户端 ACK：先更新接收窗口，再唤醒等待该序列号的发送线程。"""
         self._apply_window_update(client_id, payload)
         with self.ack_lock:
             key = (client_id, seq)
@@ -224,6 +261,7 @@ class UDPServer:
                 self.ack_events[key].set()
 
     def _apply_window_update(self, client_id, payload_or_update):
+        """应用客户端声明的可接收窗口，控制后续输出发送节奏。"""
         if isinstance(payload_or_update, tuple):
             update = payload_or_update
         else:
@@ -246,6 +284,7 @@ class UDPServer:
             return max(0, min(OUTPUT_WINDOW_SIZE, client.advertised_window_packets))
 
     def _kill_process_tree(self, proc):
+        """强制结束子进程及其子进程，避免远端命令在客户端断开后残留。"""
         try:
             if os.name == 'nt':
                 subprocess.run(
@@ -263,6 +302,7 @@ class UDPServer:
                 pass
 
     def _interrupt_process(self, proc, cmd=None):
+        """把客户端 Ctrl+C 转换为当前平台的子进程中断动作。"""
         try:
             if os.name == 'nt':
                 proc.send_signal(signal.CTRL_BREAK_EVENT)
@@ -275,6 +315,7 @@ class UDPServer:
             self._kill_process_tree(proc)
 
     def _write_pty(self, client, payload):
+        """把客户端 stdin 写入当前交互式 PTY，自动区分 Windows session 和 POSIX fd。"""
         try:
             with client.pty_lock:
                 if client.pty_session is not None:
@@ -288,6 +329,7 @@ class UDPServer:
         return False
 
     def _handle_interrupt(self, client_id):
+        """处理中断消息：交互式命令写入 Ctrl+C，普通命令中断进程组。"""
         client = self.clients.get(client_id)
         if not client:
             return
@@ -303,6 +345,7 @@ class UDPServer:
             self._interrupt_process(proc, cmd)
 
     def _handle_stdin(self, client_id, seq, payload, addr):
+        """接收交互式 stdin，ACK 后按序放入 PTY 待写队列。"""
         client = self.clients.get(client_id)
         if not client:
             return
@@ -311,6 +354,7 @@ class UDPServer:
         self.sock.sendto(ack_msg, addr)
 
         expected = client.stdin_recv_expected_seq
+        # stdin 允许跳到更新的序列号，避免交互式输入因丢包长期卡住。
         if seq == expected:
             client.stdin_recv_expected_seq = next_data_seq(expected)
         elif is_sequence_ahead(seq, expected):
@@ -324,6 +368,7 @@ class UDPServer:
                 client.stdin_event.set()
 
     def _flush_pending_stdin(self, client):
+        """取出累计的 stdin 片段并一次性写入 PTY，减少锁内 I/O 时间。"""
         with client.pty_lock:
             pending = client.pending_stdin
             client.pending_stdin = []
@@ -332,6 +377,7 @@ class UDPServer:
             self._write_pty(client, b''.join(pending))
 
     def _set_pty_size_fd(self, fd, rows, cols):
+        """在 POSIX 上通过 TIOCSWINSZ 更新 PTY 的行列数。"""
         if os.name == 'nt' or fd is None:
             return
         try:
@@ -352,6 +398,7 @@ class UDPServer:
             self._set_pty_size_fd(fd, rows, cols)
 
     def _handle_resize(self, client_id, seq, payload, addr):
+        """保存客户端终端尺寸，并同步调整当前正在运行的 PTY。"""
         client = self.clients.get(client_id)
         if not client:
             return
@@ -370,6 +417,7 @@ class UDPServer:
         self.sock.sendto(msg, addr)
 
     def _send_output_chunks_reliable(self, client_id, chunks):
+        """使用滑动窗口可靠发送输出分片，直到全部 ACK 或客户端不可用。"""
         if not chunks:
             return True
 
@@ -379,6 +427,7 @@ class UDPServer:
 
         with client.send_lock:
             packets = []
+            # 为每个输出分片预分配序列号和等待事件，后续重传始终复用同一序列号。
             for chunk in chunks:
                 seq = client.send_seq
                 ack_event = threading.Event()
@@ -395,6 +444,7 @@ class UDPServer:
                 })
                 client.send_seq = next_data_seq(client.send_seq)
 
+            # base 是窗口内最早未确认包，next_to_send 是下一个尚未首次发送的包。
             base = 0
             next_to_send = 0
             last_progress = time.monotonic()
@@ -406,6 +456,7 @@ class UDPServer:
                     for index in range(base, next_to_send):
                         if packets[index]['event'].is_set():
                             ack_to = index
+                    # 客户端按 Go-Back-N 回累计 ACK，因此确认 ack_to 之前的所有包。
                     if ack_to is not None:
                         for packet in packets[base:ack_to + 1]:
                             packet['acked'] = True
@@ -421,6 +472,7 @@ class UDPServer:
                         return True
 
                     effective_window = self._get_effective_send_window(client)
+                    # 只在客户端声明的窗口内发送新包，避免接收端缓冲区被输出洪峰压满。
                     while next_to_send < len(packets) and next_to_send - base < effective_window:
                         packet = packets[next_to_send]
                         self._send_packet(client_id, client.addr, packet['seq'], packet['chunk'])
@@ -436,6 +488,7 @@ class UDPServer:
                         and now - packets[base]['last_sent'] >= ACK_TIMEOUT
                     )
                     if timed_out:
+                        # 最早未确认包超时后，重传当前窗口内所有已发送但未累计确认的包。
                         for packet in packets[base:next_to_send]:
                             packet['retries'] += 1
                             self._send_packet(client_id, client.addr, packet['seq'], packet['chunk'])
@@ -446,6 +499,7 @@ class UDPServer:
                         continue
 
                     if next_to_send == base and effective_window <= 0:
+                        # 窗口长期为 0 说明客户端无法继续接收，避免发送线程永久占用。
                         if now - last_progress >= FLOW_CONTROL_IDLE_TIMEOUT:
                             print(f"Flow control timeout for client {client_id}")
                             return False
@@ -461,24 +515,29 @@ class UDPServer:
         return False
 
     def _send_output_reliable(self, client_id, data):
+        """把任意长度输出拆成协议分片后可靠发送。"""
         chunks = [data[i:i + MAX_DATA_SIZE] for i in range(0, len(data), MAX_DATA_SIZE)]
         return self._send_output_chunks_reliable(client_id, chunks)
 
     def _send_output_done(self, client_id):
+        """发送命令结束标记，顺带同步客户端提示符中的当前目录。"""
         client = self.clients.get(client_id)
         if not client:
             return False
         return self._send_output_chunks_reliable(client_id, [pack_output_done(client.cwd)])
 
     def _send_reliable(self, client_id, data):
+        """发送一次完整响应：输出分片之后追加结束标记。"""
         chunks = [data[i:i + MAX_DATA_SIZE] for i in range(0, len(data), MAX_DATA_SIZE)]
         chunks.append(pack_output_done(self.clients[client_id].cwd))
         return self._send_output_chunks_reliable(client_id, chunks)
 
     def _handle_command(self, client_id, seq, payload, addr):
+        """处理命令消息，先 ACK 和去重，再按 cd/普通命令/PTY 命令分流执行。"""
         client = self.clients[client_id]
 
         if seq != client.recv_expected_seq:
+            # 重复或乱序命令只回 ACK，不再次执行，避免 UDP 重传造成副作用。
             ack_msg = pack_msg(TYPE_ACK, seq, client_id, b'')
             self.sock.sendto(ack_msg, addr)
             return
@@ -493,6 +552,7 @@ class UDPServer:
             return
 
         if self._is_cd_command(cmd):
+            # cd 必须改变服务端保存的会话目录，不能只在一次 shell 子进程里执行。
             threading.Thread(
                 target=self._change_directory_and_respond,
                 args=(client_id, cmd),
@@ -511,16 +571,19 @@ class UDPServer:
         threading.Thread(target=target, args=(client_id, cmd), daemon=True).start()
 
     def _split_command(self, cmd):
+        """按平台 shell 规则拆分命令，用于识别内置命令和特殊程序。"""
         try:
             return shlex.split(cmd, posix=os.name != 'nt')
         except ValueError:
             return cmd.split()
 
     def _is_cd_command(self, cmd):
+        """识别单独的 cd 命令，排除管道、串联等需要交给 shell 的复合命令。"""
         tokens = self._split_command(cmd)
         return bool(tokens) and tokens[0].lower() == 'cd' and not any(token in {'&', '&&', '|', '||', ';'} for token in tokens)
 
     def _is_ping_command(self, cmd):
+        """识别 ping，用于 Windows 上处理 Ctrl+Break 后额外输出的特殊情况。"""
         tokens = self._split_command(cmd or '')
         if not tokens:
             return False
@@ -530,6 +593,7 @@ class UDPServer:
         return exe == 'ping'
 
     def _change_directory_and_respond(self, client_id, cmd):
+        """在客户端会话中持久化工作目录，并向客户端发送空输出或错误信息。"""
         client = self.clients.get(client_id)
         if not client:
             return
@@ -542,6 +606,7 @@ class UDPServer:
         if not args:
             target = os.path.expanduser('~')
         else:
+            # 相对路径基于该客户端保存的 cwd 解析，而不是服务端进程自己的 cwd。
             target = ' '.join(args).strip('"\'')
             target = os.path.expandvars(os.path.expanduser(target))
             if not os.path.isabs(target):
@@ -561,6 +626,7 @@ class UDPServer:
             self._send_reliable(client_id, output.encode('utf-8'))
 
     def _normalize_interrupt_text(self, text, stop_after_marker=False):
+        """统一 Windows 中断提示文本，并可截断 ping 在中断后继续输出的尾部。"""
         text = text.replace('Control-Break', 'Control-C')
         if not stop_after_marker:
             return text, False
@@ -573,7 +639,9 @@ class UDPServer:
         return text[:end], True
 
     def _stream_pipe(self, client_id, pipe, cmd=None, output_failed_event=None):
+        """持续读取子进程 stdout/stderr，边产生边可靠转发给客户端。"""
         try:
+            # 先按 UTF-8 尝试流式解码；遇到非法字节后切换到系统本地编码。
             utf8_decoder = codecs.getincrementaldecoder('utf-8')(errors='strict')
             local_decoder = codecs.getincrementaldecoder(self.encoding)(errors='replace')
             use_utf8 = True
@@ -593,6 +661,7 @@ class UDPServer:
                 else:
                     text = local_decoder.decode(chunk)
                 if os.name == 'nt':
+                    # Windows ping 在 Ctrl+Break 后可能继续打印 reply，客户端测试要求截断这些尾部。
                     text, interrupted = self._normalize_interrupt_text(text, suppress_after_interrupt)
                     if interrupted:
                         if text and not self._send_output_reliable(client_id, text.encode('utf-8')):
@@ -626,6 +695,7 @@ class UDPServer:
                 pass
 
     def _execute_and_respond(self, client_id, cmd):
+        """执行普通非交互命令，实时转发输出，并在结束时发送完成标记。"""
         client = self.clients.get(client_id)
         if not client:
             return
@@ -635,6 +705,7 @@ class UDPServer:
         output_failed_event = threading.Event()
         try:
             if os.name == 'nt':
+                # Windows 通过 CREATE_NEW_PROCESS_GROUP 支持后续发送 CTRL_BREAK_EVENT。
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -644,6 +715,7 @@ class UDPServer:
                     shell=True
                 )
             else:
+                # POSIX 创建新进程组，Ctrl+C 时可以中断整棵命令进程组。
                 proc = subprocess.Popen(
                     ['bash', '-c', cmd],
                     stdout=subprocess.PIPE,
@@ -657,6 +729,7 @@ class UDPServer:
                 client.current_command = cmd
 
             for pipe in (proc.stdout, proc.stderr):
+                # stdout/stderr 分别开线程读取，避免任一管道缓冲区满导致子进程阻塞。
                 if pipe is None:
                     continue
                 thread = threading.Thread(target=self._stream_pipe, args=(client_id, pipe, cmd, output_failed_event), daemon=True)
@@ -683,6 +756,7 @@ class UDPServer:
                 self._send_output_done(client_id)
 
     def _execute_pty_and_respond(self, client_id, cmd):
+        """进入交互式命令路径，并按平台选择 POSIX PTY 或 Windows pywinpty。"""
         cmd = strip_pty_prefix(cmd)
         if not cmd:
             self._send_reliable(client_id, b"Error: empty PTY command\n")
@@ -693,6 +767,7 @@ class UDPServer:
             self._execute_posix_pty_and_respond(client_id, cmd)
 
     def _execute_posix_pty_and_respond(self, client_id, cmd):
+        """在 POSIX 上创建伪终端运行交互式命令，并双向转发 PTY 数据。"""
         client = self.clients.get(client_id)
         if not client:
             return
@@ -703,6 +778,7 @@ class UDPServer:
         try:
             master_fd, slave_fd = pty.openpty()
             self._set_pty_size_fd(slave_fd, client.term_rows, client.term_cols)
+            # 子进程的 stdin/stdout/stderr 都连接到 PTY slave，服务端从 master 端读写。
             proc = subprocess.Popen(
                 ['bash', '-lc', cmd],
                 stdin=slave_fd,
@@ -717,6 +793,7 @@ class UDPServer:
 
             with client.process_lock:
                 client.current_process = proc
+            # 记录 PTY 句柄后，后续 stdin/resize/interrupt 消息才能定位到当前交互会话。
             with client.pty_lock:
                 client.pty_fd = master_fd
                 client.pty_session = None
@@ -725,6 +802,7 @@ class UDPServer:
             self._flush_pending_stdin(client)
 
             while self.running and proc.poll() is None:
+                # 每轮先写入客户端累计 stdin，再读取 PTY 输出并可靠发送给客户端。
                 self._flush_pending_stdin(client)
                 readable, _, _ = select.select([master_fd], [], [], 0.1)
                 if not readable:
@@ -739,6 +817,7 @@ class UDPServer:
                     break
 
             try:
+                # 子进程退出后再非阻塞排空一次 PTY，避免最后一段输出丢失。
                 while True:
                     readable, _, _ = select.select([master_fd], [], [], 0)
                     if not readable:
@@ -778,6 +857,7 @@ class UDPServer:
                 self._send_output_done(client_id)
 
     def _read_available_windows_pty_output(self, session, first_chunk):
+        """合并 Windows PTY 当前已就绪的输出，尽量填满一个 UDP 分片。"""
         chunks = [first_chunk]
         total = len(first_chunk)
         while total < MAX_DATA_SIZE:
@@ -789,6 +869,7 @@ class UDPServer:
         return b''.join(chunks)
 
     def _execute_windows_pty_and_respond(self, client_id, cmd):
+        """在 Windows 上通过 pywinpty 运行交互式命令并转发输入输出。"""
         client = self.clients.get(client_id)
         if not client:
             return
@@ -796,6 +877,7 @@ class UDPServer:
         session = None
         try:
             session = WindowsPtySession(cmd, client.cwd, client.term_rows, client.term_cols)
+            # Windows PTY 没有 POSIX fd，因此保存 session 对象供 stdin/resize/interrupt 使用。
             with client.pty_lock:
                 client.pty_session = session
                 client.pty_fd = None
@@ -804,6 +886,7 @@ class UDPServer:
             self._flush_pending_stdin(client)
 
             while self.running and session.is_alive():
+                # pywinpty 输出采用短超时轮询，同时把客户端积累的 stdin 写回远端程序。
                 self._flush_pending_stdin(client)
                 chunk = session.read(4096)
                 if chunk:
@@ -813,6 +896,7 @@ class UDPServer:
                 elif not session.is_alive():
                     break
 
+            # 会话结束后短暂 drain，收集退出前最后刷出的提示符或输出。
             drain_until = time.monotonic() + 1
             while self.running and time.monotonic() < drain_until:
                 chunk = session.read(4096, timeout=0.1)
@@ -840,6 +924,7 @@ class UDPServer:
                 self._send_output_done(client_id)
 
     def _cleanup_client_runtime(self, client):
+        """清理客户端运行时资源，包括 PTY、待输入和仍在运行的命令进程。"""
         with client.pty_lock:
             session = client.pty_session
             fd = client.pty_fd
@@ -866,6 +951,7 @@ class UDPServer:
             self._kill_process_tree(proc)
 
     def _cleanup_loop(self):
+        """定期移除长时间没有心跳的客户端，并释放其远端资源。"""
         while self.running:
             now = time.time()
             to_remove = []
