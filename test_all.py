@@ -1,3 +1,9 @@
+"""UDP 远程终端端到端测试脚本。
+
+该脚本不依赖测试框架，直接启动本地 UDPServer，并用原始 UDP socket 模拟客户端，
+覆盖协议编解码、心跳、流控、命令执行、重传去重、Ctrl+C、cd 持久化和 PTY 交互。
+"""
+
 import socket
 import struct
 import threading
@@ -8,12 +14,16 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import *
 
+# 使用固定的本地测试端口，避免和默认 9999 服务端端口互相干扰。
 TEST_PORT = 19888
+
+# results 收集最终汇总；recv_expected 为每个模拟客户端维护期望输出序列号。
 results = []
 recv_expected = {}
 
 
 def log_test(name, passed, detail=""):
+    """记录单个断言结果，并兼容中文 Windows 控制台的编码输出。"""
     status = "PASS" if passed else "FAIL"
     msg = f"[{status}] {name}"
     if detail and not passed:
@@ -27,12 +37,14 @@ def log_test(name, passed, detail=""):
 
 
 def recv_response(sock, cid, addr, timeout=5):
+    """接收一次普通命令响应，按输出序列号回 ACK，直到收到结束标记或超时。"""
     got_ack = False
     all_data = b''
     expected = recv_expected.get(cid, 0)
     done = False
 
     def process_payload(payload):
+        """区分普通输出和命令结束控制载荷。"""
         nonlocal all_data, done
         if unpack_output_done(payload) is not None:
             done = True
@@ -42,6 +54,7 @@ def recv_response(sock, cid, addr, timeout=5):
     sock.settimeout(timeout)
     try:
         while not done:
+            # 模拟客户端的 Go-Back-N 接收逻辑：只处理期望序列号，其他包回上一个 ACK。
             resp_data, _ = sock.recvfrom(65535)
             resp = unpack_msg(resp_data)
             if resp is None:
@@ -66,6 +79,7 @@ def recv_response(sock, cid, addr, timeout=5):
 
 
 def recv_realtime_response(sock, cid, addr, timeout=5):
+    """接收实时输出响应，并记录第一段输出出现时间以验证边执行边发送。"""
     got_ack = False
     all_data = b''
     first_output_at = None
@@ -85,6 +99,7 @@ def recv_realtime_response(sock, cid, addr, timeout=5):
     sock.settimeout(timeout)
     try:
         while not done:
+            # 模拟客户端的 Go-Back-N 接收逻辑：只处理期望序列号，其他包回上一个 ACK。
             resp_data, _ = sock.recvfrom(65535)
             resp = unpack_msg(resp_data)
             if resp is None:
@@ -109,6 +124,7 @@ def recv_realtime_response(sock, cid, addr, timeout=5):
 
 
 def recv_response_with_window(sock, cid, addr, advertised_packets=1, timeout=5):
+    """用指定接收窗口 ACK 输出，用于验证服务端流控不会丢失大输出。"""
     got_ack = False
     all_data = b''
     expected = recv_expected.get(cid, 0)
@@ -124,6 +140,7 @@ def recv_response_with_window(sock, cid, addr, advertised_packets=1, timeout=5):
     sock.settimeout(timeout)
     try:
         while not done:
+            # 模拟客户端的 Go-Back-N 接收逻辑：只处理期望序列号，其他包回上一个 ACK。
             resp_data, _ = sock.recvfrom(65535)
             resp = unpack_msg(resp_data)
             if resp is None:
@@ -149,6 +166,7 @@ def recv_response_with_window(sock, cid, addr, advertised_packets=1, timeout=5):
 
 
 def recv_pty_response(sock, cid, addr, stdin_data, timeout=8, send_after_output=False):
+    """模拟交互式客户端：接收 PTY 输出，同时按场景把 stdin 发给服务端。"""
     got_ack = False
     stdin_sent = False
     all_data = b''
@@ -157,6 +175,7 @@ def recv_pty_response(sock, cid, addr, stdin_data, timeout=8, send_after_output=
     stdin_seq = 0
 
     def send_stdin_once():
+        """只发送一次预设 stdin，避免每个输出包都重复输入命令。"""
         nonlocal stdin_sent, stdin_seq
         if stdin_sent:
             return
@@ -176,6 +195,7 @@ def recv_pty_response(sock, cid, addr, stdin_data, timeout=8, send_after_output=
     sock.settimeout(timeout)
     try:
         while not done:
+            # 模拟客户端的 Go-Back-N 接收逻辑：只处理期望序列号，其他包回上一个 ACK。
             resp_data, _ = sock.recvfrom(65535)
             resp = unpack_msg(resp_data)
             if resp is None:
@@ -209,6 +229,7 @@ print("  UDP Remote Terminal - Basic Feature Test Suite", flush=True)
 print("=" * 60, flush=True)
 
 # ===== Test 1: Protocol Pack/Unpack =====
+# 验证基础包头、魔数、长度校验和非法类型过滤，确保双方协议入口可靠。
 print("\n[1] Protocol Pack/Unpack", flush=True)
 data = b'hello world'
 packed = pack_msg(TYPE_COMMAND, 70000, 12345, data)
@@ -247,11 +268,13 @@ try:
 except ValueError:
     log_test("Invalid type pack rejected", True)
 
+# 输入清洗和 ANSI 过滤直接影响远端 shell 实际收到的命令文本。
 print("\n[1b] Advanced Protocol Helpers", flush=True)
 log_test("ANSI escape stripped", strip_ansi_sequences(b'\x1b[31mRED\x1b[0m') == b'RED')
 log_test("Tab preserved", normalize_command_input('echo\tTAB_OK\n') == 'echo\tTAB_OK\n')
 log_test("ANSI input normalized", normalize_command_input('echo \x1b[31mANSI_OK\x1b[0m\n') == 'echo ANSI_OK\n')
 
+# 高层控制载荷复用普通协议消息承载窗口、尺寸、提示符和 PTY 模式信息。
 print("\n[1c] High-Level Protocol Helpers", flush=True)
 resize_payload = pack_resize(40, 120)
 window_payload = pack_window_update(3, 4096)
@@ -269,6 +292,7 @@ log_test("Plain echo command not PTY", not should_use_pty_command('echo OK'))
 log_test("PTY prefix stripped", strip_pty_prefix('pty vim README.md') == 'vim README.md')
 
 # ===== Start server =====
+# 后续测试直接调用服务端内部接收和清理循环，避免额外进程管理成本。
 print("\n[2] Starting UDP server...", flush=True)
 from server import UDPServer
 server = UDPServer('127.0.0.1', TEST_PORT)
@@ -281,6 +305,7 @@ filtered_interrupt, saw_interrupt = server._normalize_interrupt_text('Control-Br
 log_test("Ping interrupt tail filtered", saw_interrupt and filtered_interrupt == 'Control-C\r\n')
 
 # ===== Test 2: Heartbeat =====
+# 心跳 ACK 是客户端启动成功、提示符同步和服务端会话 ID 检测的基础。
 print("\n[2] Heartbeat", flush=True)
 sock_hb = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock_hb.settimeout(3)
@@ -297,6 +322,7 @@ except socket.timeout:
     log_test("Heartbeat ACK received", False, "timeout")
 sock_hb.close()
 
+# resize 和 window update 都只改变服务端状态，不直接产生命令输出。
 print("\n[2a] Resize and Flow-Control State", flush=True)
 sock_state = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock_state.settimeout(2)
@@ -319,6 +345,7 @@ log_test("Window update state updated", client_state is not None and client_stat
 sock_state.close()
 
 # ===== Test 2b: Client Connection Check =====
+# 直接实例化客户端对象，覆盖连接探测、断连唤醒和服务端重启后的等待退出路径。
 print("\n[2b] Client Connection Check", flush=True)
 import client as client_module
 from client import UDPClient
@@ -368,6 +395,7 @@ try:
     wait_finished = threading.Event()
 
     def wait_for_command_output():
+        """验证连接错误会唤醒正在等待输出完成的线程。"""
         client_wait._wait_for_command_output()
         wait_finished.set()
 
@@ -384,6 +412,7 @@ try:
     send_result = []
 
     def send_command_without_ack():
+        """验证连接错误会让正在等待 ACK 的发送流程返回失败。"""
         send_result.append(client_send._send_reliable(b'echo blocked\n'))
         send_finished.set()
 
@@ -405,6 +434,7 @@ try:
     client_reconnect._send_interrupt = send_reconnect_interrupt
 
     def wait_for_reconnected_command_output():
+        """验证普通心跳恢复不会误结束正在等待的命令输出。"""
         client_reconnect._wait_for_command_output()
         reconnect_wait_finished.set()
 
@@ -424,6 +454,7 @@ try:
     restart_wait_finished = threading.Event()
 
     def wait_for_restarted_command_output():
+        """验证服务端会话 ID 改变后，客户端重置序列号并退出旧命令等待。"""
         client_restart._wait_for_command_output()
         restart_wait_finished.set()
 
@@ -472,6 +503,7 @@ finally:
     client_module._thread.interrupt_main = original_interrupt_main
 
 # ===== Test 3: Command Execution =====
+# 覆盖普通命令执行、非 ASCII 输出、本地文件输出和带引号命令的 shell 解析。
 print("\n[3] Command Execution", flush=True)
 sock_cmd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 cid_cmd = 10002
@@ -511,6 +543,7 @@ sock_quote.close()
 
 time.sleep(0.3)
 
+# 大输出、实时输出、流控窗口、ACK 中断和地址重绑定都属于 UDP 可靠传输边界场景。
 print("\n[3b] Advanced Output", flush=True)
 rt_cmd = 'python -c "import time; print(\'RT1\', flush=True); time.sleep(1.5); print(\'RT2\', flush=True)"'
 if os.name == 'nt':
@@ -556,6 +589,7 @@ outage_finished = threading.Event()
 
 
 def send_output_during_ack_outage():
+    """模拟客户端短暂不回 ACK，确认服务端不会过早放弃输出发送。"""
     outage_result.append(server._send_output_reliable(cid_outage, b'OUTAGE_OK'))
     outage_finished.set()
 
@@ -591,6 +625,7 @@ rebind_finished = threading.Event()
 
 
 def send_output_to_rebound_client():
+    """模拟客户端源端口变化，确认重传会使用最新的客户端地址。"""
     rebind_result.append(server._send_output_reliable(cid_rebind, b'REBIND_OK'))
     rebind_finished.set()
 
@@ -622,6 +657,7 @@ sock_rebind_new.close()
 time.sleep(0.3)
 
 # ===== Test 4: Multiple Clients =====
+# 两个客户端使用不同 client_id，验证服务端不会混用 cwd、输出序列号或响应数据。
 print("\n[4] Multiple Clients", flush=True)
 cid1, cid2 = 10003, 10004
 sock1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -645,6 +681,7 @@ sock2.close()
 time.sleep(0.3)
 
 # ===== Test 5: Heartbeat Timeout =====
+# 模拟客户端心跳过期，验证清理逻辑会移除会话。
 print("\n[5] Heartbeat Timeout", flush=True)
 cid_to = 10005
 sock_to = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -668,6 +705,7 @@ else:
 sock_to.close()
 
 # ===== Test 6: Stop-Wait ARQ Dedup =====
+# 同一命令序列号重复发送时，服务端只能 ACK，不能再次执行有副作用的命令。
 print("\n[6] Stop-Wait ARQ Dedup", flush=True)
 cid_arq = 10006
 sock_arq = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -684,6 +722,7 @@ sock_arq.close()
 time.sleep(0.3)
 
 # ===== Test 7: Control Characters =====
+# 退格、回车、Tab 等控制字符会影响命令规范化，必须确认 shell 收到预期文本。
 print("\n[7] Control Characters", flush=True)
 cid_ctrl1 = 10007
 sock_ctrl1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -710,6 +749,7 @@ log_test("Tab passed to shell", "TAB_OK" in ctrl3_str, f"out={ctrl3_str[:80]}")
 sock_ctrl3.close()
 time.sleep(0.3)
 
+# Windows ping 中断时输出顺序特殊，单独验证中断标记之后不再混入 reply。
 print("\n[7b] Interrupt Output Ordering", flush=True)
 if os.name == 'nt':
     cid_ping = 10021
@@ -762,6 +802,7 @@ else:
 time.sleep(0.3)
 
 # ===== Test 8: Error Handling =====
+# 无效命令应返回错误文本；无效协议包应被忽略且不能让服务端崩溃。
 print("\n[8] Error Handling", flush=True)
 cid_err = 10009
 sock_err = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -778,6 +819,7 @@ sock_err.close()
 time.sleep(0.3)
 
 # ===== Test 9: Server Unreachable =====
+# 发送到无人监听端口时应表现为超时，而不是收到伪响应。
 print("\n[9] Server Unreachable", flush=True)
 sock_un = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock_un.settimeout(0.5)
@@ -794,6 +836,7 @@ log_test("Unreachable timeout detected", not received)
 sock_un.close()
 
 # ===== Test 10: Persistent cd command =====
+# cd 是会话状态，不是一次性子进程输出；后续命令必须在新的 cwd 中执行。
 print("\n[10] Persistent cd Command", flush=True)
 cid_pwd = 10011
 sock_pwd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -815,6 +858,7 @@ else:
 sock_pwd.close()
 
 time.sleep(0.3)
+# PTY 测试覆盖交互式命令的 stdin/stdout 双向转发；Windows 缺依赖时验证错误提示。
 print("\n[11] PTY Simplified Interaction", flush=True)
 cid_pty = 10020
 sock_pty = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -844,6 +888,7 @@ else:
 sock_pty.close()
 
 # ===== Stop server =====
+# 测试脚本直接关闭 socket，让后台接收线程从阻塞 recvfrom 中退出。
 server.running = False
 try:
     server.sock.close()
@@ -851,6 +896,7 @@ except Exception:
     pass
 
 # ===== SUMMARY =====
+# 汇总所有手写断言，退出码保持不变，方便人工查看完整通过/失败列表。
 print("\n" + "=" * 60, flush=True)
 print("  TEST SUMMARY", flush=True)
 print("=" * 60, flush=True)
