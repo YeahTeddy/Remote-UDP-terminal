@@ -14,6 +14,7 @@ import sys
 import os
 import shutil
 import _thread
+import codecs
 
 # Windows 控制台不能像 POSIX 一样用 select/os.read 读取原始按键，
 # 因此这里直接声明 Win32 Console API 结构体来读取方向键、功能键和 Unicode 输入。
@@ -120,6 +121,7 @@ class UDPClient:
         self.interactive_mode = False
         self.raw_terminal_attrs = None
         self.pending_windows_high_surrogate = None
+        self.interactive_stdout_decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         self.windows_stdin_handle = self._get_windows_stdin_handle()
         self.last_rows = 24
         self.last_cols = 80
@@ -434,6 +436,25 @@ class UDPClient:
     def _make_window_update_payload(self):
         return pack_window_update(self._available_recv_window_packets(), self._available_recv_window_bytes())
 
+    def _reset_interactive_stdout_decoder(self):
+        self.interactive_stdout_decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+
+    def _write_interactive_output(self, payload):
+        if os.name == 'nt':
+            text = self.interactive_stdout_decoder.decode(payload)
+            if text:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            return
+
+        out = getattr(sys.stdout, 'buffer', None)
+        if out is not None:
+            out.write(payload)
+            out.flush()
+        else:
+            sys.stdout.write(payload.decode('utf-8', errors='replace'))
+            sys.stdout.flush()
+
     def _process_output_payload(self, payload):
         """处理服务端输出载荷；控制载荷更新状态，普通载荷写到 stdout。"""
         done_cwd = unpack_output_done(payload)
@@ -444,17 +465,14 @@ class UDPClient:
             return
 
         with self.print_lock:
-            if self.interactive_mode:
-                out = getattr(sys.stdout, 'buffer', None)
-                if out is not None:
-                    out.write(payload)
-                    out.flush()
+            try:
+                if self.interactive_mode:
+                    self._write_interactive_output(payload)
                 else:
-                    sys.stdout.write(payload.decode('utf-8', errors='replace'))
+                    sys.stdout.write(strip_ansi_sequences(payload).decode('utf-8', errors='replace'))
                     sys.stdout.flush()
-            else:
-                sys.stdout.write(strip_ansi_sequences(payload).decode('utf-8', errors='replace'))
-                sys.stdout.flush()
+            except Exception:
+                pass
 
     def _handle_output_packet(self, seq, payload):
         """按 Go-Back-N 语义只接受期望序列号，乱序包用上一个 ACK 触发重传。"""
@@ -730,6 +748,7 @@ class UDPClient:
         """运行交互式 PTY 转发循环，直到服务端发送输出结束标记。"""
         self.interactive_mode = True
         self.waiting_for_output = True
+        self._reset_interactive_stdout_decoder()
         self._enter_raw_mode()
         try:
             while self.running and not self.output_done_event.is_set():
