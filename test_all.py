@@ -355,8 +355,30 @@ log_test("Windows PTY Chinese input encoded", os.name != 'nt' or client_ok._wind
 if os.name == 'nt':
     client_ok.pending_windows_high_surrogate = '\ud83d'
     log_test("Windows PTY surrogate pair encoded", client_ok._windows_char_to_input_bytes('\ude00') == '😀'.encode('utf-8'))
+
+    split_output = []
+
+    class SplitStdout:
+        def write(self, text):
+            split_output.append(text)
+            return len(text)
+
+        def flush(self):
+            pass
+
+    saved_stdout = sys.stdout
+    try:
+        sys.stdout = SplitStdout()
+        client_ok._reset_interactive_stdout_decoder()
+        data = '中'.encode('utf-8')
+        client_ok._write_interactive_output(data[:1])
+        client_ok._write_interactive_output(data[1:])
+    finally:
+        sys.stdout = saved_stdout
+    log_test("Windows PTY output handles split UTF-8", ''.join(split_output) == '中')
 else:
     log_test("Windows PTY surrogate pair encoded", True, "non-Windows")
+    log_test("Windows PTY output handles split UTF-8", True, "non-Windows")
 
 client_gbn = UDPClient('127.0.0.1', TEST_PORT)
 gbn_processed = []
@@ -372,6 +394,28 @@ log_test(
     and ack_second == 1,
 )
 client_gbn._close_socket()
+
+client_display_error = UDPClient('127.0.0.1', TEST_PORT)
+client_display_error.interactive_mode = True
+
+class BrokenStdout:
+    def write(self, text):
+        raise OSError("display failed")
+
+    def flush(self):
+        pass
+
+saved_stdout = sys.stdout
+try:
+    sys.stdout = BrokenStdout()
+    ack_display_error = client_display_error._handle_output_packet(0, b'abc')
+finally:
+    sys.stdout = saved_stdout
+log_test(
+    "Output ACK is independent of local display",
+    ack_display_error == 0 and client_display_error.recv_expected_seq == 1,
+)
+client_display_error._close_socket()
 
 client_ok.running = True
 threading.Thread(target=client_ok._recv_loop, daemon=True).start()
