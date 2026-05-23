@@ -155,8 +155,7 @@ Remote-UDP-terminal/
 ├── server.py                         # UDP 服务端、命令执行、可靠输出、多客户端、心跳清理和 PTY/ConPTY
 ├── client.py                         # UDP 客户端、命令输入、输出显示、中断、心跳、窗口同步和 PTY 输入
 ├── test_all.py                       # 自动化测试脚本
-├── README.md                         # 使用说明和功能完成情况
-└── 基于UDP的远程终端实验指导书.md      # 实验要求
+└── README.md                         # 使用说明和功能完成情况
 ```
 
 ## 六、协议格式
